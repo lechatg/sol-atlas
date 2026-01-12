@@ -82,7 +82,8 @@ async def _process_large_result_set_batched(
         # Summarize this batch with LLM
         logger.info(f"🤖 Summarizing batch {batch_num} ({len(batch_messages)} messages)...")
         batch_summary = await _summarize_message_batch(batch_messages, batch_num, user_lang, conv_ctx)
-        batch_summaries.append(f"**Batch {batch_num}:**\n{batch_summary}")
+        # Don't add "Batch X" prefix - let final LLM organize by topics
+        batch_summaries.append(batch_summary)
         
         logger.info(f"✅ Batch {batch_num} complete ({len(all_messages)}/{total_count} messages processed)")
     
@@ -155,24 +156,27 @@ async def _combine_batch_summaries(batch_summaries: list, user_lang: str, conv_c
     try:
         combined_text = "\n\n".join(batch_summaries)
         
-        prompt = f"""Create a comprehensive digest from these batch summaries:
+        prompt = f"""Create a comprehensive digest by combining and reorganizing these summaries:
 
 {combined_text}
 
 Provide a well-structured digest (max 200 words) that:
-1. Identifies overall themes across all batches
-2. Highlights most important discussions
-3. Notes key participants if relevant
-4. Maintains chronological flow if relevant
+1. Organizes content by TOPICS/THEMES (not by batch or time)
+2. Group related discussions under clear topic headings
+3. Highlights most important discussions and decisions
+4. Notes key participants if relevant
+5. Use clear section headers (e.g., "🔐 Security Updates", "💰 Market Discussion", "🚀 New Features")
+6. Maintains chronological flow if relevant
 
 IMPORTANT: Format using HTML tags for Telegram:
-- Use <b>bold</b> for emphasis
+- Use <b>bold</b> for section headers and emphasis
 - Use <i>italic</i> for secondary emphasis
-- Use bullet points with • or numbered lists
+- Use bullet points with • for key points
 - Use line breaks (just newlines, no <br>)
 - Do NOT use markdown (**, ##, ###) - use HTML only
+- Do NOT use "Batch 1", "Batch 2" or similar technical terms
 
-Be engaging and well-organized."""
+Be engaging, topic-focused, and well-organized."""
         
         from luka_bot.services.llm_model_factory import create_llm_model_with_fallback
         from pydantic_ai import Agent
@@ -402,9 +406,8 @@ async def search_knowledge_base(
         logger.info(f"  └─ Filters: from_user='{from_user}', date_from='{date_from}', date_to='{date_to}'")
         logger.info(f"  └─ Settings: max_results={max_results}, min_score={min_score}")
         
-        # Create cache key from search parameters to prevent duplicate ES queries
+        # Create initial cache params (will finalize after kb_indices determined)
         # This happens when pydantic-ai re-executes tools during get_output()
-        # Note: We'll update kb_indices after scope resolution
         cache_params = {
             'user_id': conv_ctx.user_id,
             'query': query,
@@ -413,17 +416,9 @@ async def search_knowledge_base(
             'date_to': date_to,
             'max_results': max_results,
             'min_score': min_score,
-            'kb_scope': conv_ctx.kb_scope,  # Include scope in cache key
+            'kb_scope': conv_ctx.kb_scope,
             'thread_kb': conv_ctx.thread_knowledge_bases
         }
-        cache_key = hashlib.md5(json.dumps(cache_params, sort_keys=True).encode()).hexdigest()
-        
-        # Check cache
-        if cache_key in _kb_search_cache:
-            cached_result = _kb_search_cache[cache_key]
-            logger.info(f"💾 Returning CACHED result (key: {cache_key[:8]}..., {len(cached_result)} chars)")
-            logger.info(f"🔍 KB Search COMPLETED (from cache)")
-            return cached_result
         
         # Check if Elasticsearch is enabled
         if not settings.ELASTICSEARCH_ENABLED:
@@ -449,7 +444,8 @@ async def search_knowledge_base(
                 logger.info("User scope: all sources - using default KB behavior")
             elif scope_source in ["auto_groups", "custom"] and scope_group_ids:
                 # User has specific group scope - map to KB indices
-                kb_indices = [f"group_{group_id}_messages" for group_id in scope_group_ids]
+                # Format: tg-kb-group-{group_id} (matches ELASTICSEARCH_GROUP_KB_PREFIX)
+                kb_indices = [f"{settings.ELASTICSEARCH_GROUP_KB_PREFIX}{abs(group_id)}" for group_id in scope_group_ids]
                 logger.info(f"User scope: {scope_source} - searching groups: {scope_group_ids}")
                 logger.info(f"Mapped to KB indices: {kb_indices}")
             else:
@@ -468,12 +464,19 @@ async def search_knowledge_base(
                 kb_indices = [f"{settings.ELASTICSEARCH_USER_KB_PREFIX}{conv_ctx.user_id}"]
                 logger.info(f"Searching user KB: {kb_indices[0]}")
         
-        # Update cache key with final kb_indices
+        # Finalize cache key with kb_indices
         cache_params['kb_indices'] = kb_indices
         cache_key = hashlib.md5(json.dumps(cache_params, sort_keys=True).encode()).hexdigest()
         
+        # Check cache (after kb_indices determined to ensure consistent key)
+        if cache_key in _kb_search_cache:
+            cached_result = _kb_search_cache[cache_key]
+            logger.info(f"💾 Returning CACHED result (key: {cache_key[:8]}..., {len(cached_result)} chars)")
+            logger.info(f"🔍 KB Search COMPLETED (from cache)")
+            return cached_result
+
         # # TEST: Override with specific test index (comment out when done testing)
-        # kb_indices = ["tg-kb-group-1001902150742"]
+        # kb_indices = ["tg-kb-group-1002083366283"]
         # logger.info(f"🧪 TEST OVERRIDE: Using test index: {kb_indices}")
         
         # Parse and validate parameters
@@ -791,16 +794,29 @@ async def search_knowledge_base(
                 logger.warning(f"Failed to generate summary: {e}")
                 # Continue without summary
         
+        # Detect output format from context metadata
+        output_format = conv_ctx.metadata.get('output_format',
+                                              'telegram') if conv_ctx and conv_ctx.metadata else 'telegram'
+
         # Header with count
         message_word = "message" if len(display_results) == 1 else "messages"
         if user_lang == "ru":
             message_word = "сообщение" if len(display_results) == 1 else "сообщения" if len(display_results) < 5 else "сообщений"
         
-        response_parts.extend([
-            "\n━━━━━━━━━━━━━━━━━━━━",
-            f"📚 Found {total_found} {message_word} (showing {len(display_results)} samples)\n"
-        ])
-        
+        # Format header based on output format
+        if output_format == "markdown":
+            # Web UI: Use markdown formatting
+            response_parts.extend([
+                f"\n### 📚 Found {total_found} {message_word}\n",
+                f"*Showing {len(display_results)} samples*\n"
+            ])
+        else:
+            # Telegram: Use ASCII art
+            response_parts.extend([
+                "\n━━━━━━━━━━━━━━━━━━━━",
+                f"📚 Found {total_found} {message_word} (showing {len(display_results)} samples)\n"
+            ])
+
         for i, result in enumerate(display_results, 1):
             doc = result['doc']
             
@@ -851,30 +867,43 @@ async def search_knowledge_base(
                 except Exception as e:
                     logger.debug(f"Failed to generate deeplink: {e}")
             
-            # Build message card with simple box decoration
-            # ┌─ at first line, └───── as divider
-            # Make date clickable if deeplink is available
-            if deeplink_url:
-                date_display = f"<a href=\"{deeplink_url}\">{date_str}</a>"
+            # Build message card based on output format
+            if output_format == "markdown":
+                # Web UI: Use markdown card with proper formatting
+                if deeplink_url:
+                    # Clickable card with link
+                    card_lines = [
+                        f"**👤 {sender}** · [{date_str}]({deeplink_url})",
+                        f"> {text}",
+                        ""  # Empty line for separation
+                    ]
+                else:
+                    # Non-clickable card
+                    card_lines = [
+                        f"**👤 {sender}** · {date_str}",
+                        f"> {text}",
+                        ""  # Empty line for separation
+                    ]
             else:
-                date_display = date_str
-            
-            card_lines = [
-                # f"┌─ 👤 <b>{sender}</b> • {date_str}",
-                f"┌─ 👤 <b>{sender}</b> • {date_display}",
-                f"\"{text}\""
+                # Telegram: Use ASCII box decoration with HTML tags
+                if deeplink_url:
+                    date_display = f"<a href=\"{deeplink_url}\">{date_str}</a>"
+                else:
+                    date_display = date_str
+
+                card_lines = [
+                    f"┌─ 👤 <b>{sender}</b> • {date_display}",
+                    f"\"{text}\"",
+                    "└─────"
             ]
-            
-            # # Add raw URL link if available (no HTML anchor tags)
-            # if deeplink_url:
-            #     card_lines.append(f"🔗 {deeplink_url}")
-            
-            # Add divider after each message
-            card_lines.append("└─────")
-            
+
             response_parts.append("\n".join(card_lines) + "\n")
         
-        response_parts.append("━━━━━━━━━━━━━━━━━━━━\n")
+        # Add footer based on output format
+        if output_format == "markdown":
+            response_parts.append("---\n")  # Markdown horizontal rule
+        else:
+            response_parts.append("━━━━━━━━━━━━━━━━━━━━\n")  # Telegram ASCII art
         
         # Return the structured results
         # The LLM's summary will be separate from this structured data
@@ -960,16 +989,26 @@ async def list_recent_messages(
         all_results.sort(key=lambda x: x['doc'].get('message_date', ''), reverse=True)
         all_results = all_results[:actual_max]
         
+        # Detect output format from context metadata
+        output_format = conv_ctx.metadata.get('output_format',
+                                              'telegram') if conv_ctx and conv_ctx.metadata else 'telegram'
+
         # Format results
         message_word = "message" if len(all_results) == 1 else "messages"
         if user_lang == "ru":
             message_word = "сообщение" if len(all_results) == 1 else "сообщения" if len(all_results) < 5 else "сообщений"
         
-        lines = [
-            "\n━━━━━━━━━━━━━━━━━━━━",
-            f"📚 Your {len(all_results)} most recent {message_word}:\n"
-        ]
-        
+        # Format header based on output format
+        if output_format == "markdown":
+            lines = [
+                f"\n### 📚 Your {len(all_results)} most recent {message_word}\n"
+            ]
+        else:
+            lines = [
+                "\n━━━━━━━━━━━━━━━━━━━━",
+                f"📚 Your {len(all_results)} most recent {message_word}:\n"
+            ]
+
         for result in all_results:
             doc = result['doc']
             sender = doc.get('sender_name', 'Unknown')
@@ -992,10 +1031,18 @@ async def list_recent_messages(
             if len(text) > 100:
                 text = text[:100] + "..."
             
-            lines.append(f"• {sender} ({date_str}): {text}")
-        
-        lines.append("━━━━━━━━━━━━━━━━━━━━\n")
-        
+            # Format entry based on output format
+            if output_format == "markdown":
+                lines.append(f"- **{sender}** ({date_str}): {text}")
+            else:
+                lines.append(f"• {sender} ({date_str}): {text}")
+
+        # Format footer based on output format
+        if output_format == "markdown":
+            lines.append("\n---\n")
+        else:
+            lines.append("━━━━━━━━━━━━━━━━━━━━\n")
+
         return "\n".join(lines)
         
     except Exception as e:
@@ -1154,18 +1201,31 @@ async def get_knowledge_base_stats(
                 if include_timeline and "timeline" in advanced_stats:
                     timeline = advanced_stats["timeline"]
                     if timeline:
+                        # Detect output format
+                        output_format = conv_ctx.metadata.get('output_format',
+                                                              'telegram') if conv_ctx and conv_ctx.metadata else 'telegram'
+
                         period_desc = f"{date_from or 'all time'}"
                         stats_parts.append(_("kb.stats.timeline_header", user_lang, period=period_desc))
                         for entry in timeline[-7:]:  # Show last 7 days
                             date = entry["date"]
                             count = entry["message_count"]
-                            # Create simple bar chart
+                            # Create simple bar chart based on format
                             max_bar_len = 20
-                            bar_len = min(int((count / max(1, max(e["message_count"] for e in timeline))) * max_bar_len), max_bar_len)
-                            bar = "█" * bar_len
-                            stats_parts.append(_("kb.stats.timeline_entry", user_lang, 
-                                               date=date, bar=bar, count=count))
-                
+                            bar_len = min(
+                                int((count / max(1, max(e["message_count"] for e in timeline))) * max_bar_len),
+                                max_bar_len)
+
+                            if output_format == "markdown":
+                                # Use markdown-friendly bar (repeated character)
+                                bar = "▓" * bar_len
+                            else:
+                                # Use Telegram ASCII bar
+                                bar = "█" * bar_len
+
+                            stats_parts.append(_("kb.stats.timeline_entry", user_lang,
+                                                 date=date, bar=bar, count=count))
+
                 # Hourly activity
                 if include_hourly_activity and "hourly_activity" in advanced_stats:
                     hourly = advanced_stats["hourly_activity"]
@@ -1420,10 +1480,11 @@ The knowledge base contains THOUSANDS of messages with full search capability.
 1. Write 1-2 sentences BEFORE calling any tool (provide context)
 2. Call each tool EXACTLY ONCE per query - NEVER duplicate calls
 3. Leave date filters EMPTY unless user mentions time period
-4. The tool will return formatted message cards - don't duplicate them in your response
-5. After tool returns results, write 2-3 sentence summary of what was found
-6. If tool returns empty, answer from your general knowledge
-7. Never leave response empty - always be helpful
+4. For crypto queries: Tool returns synthesized answer - present it naturally
+5. For TG digests (>30 msgs): Tool returns complete digest + sample cards - present naturally
+6. For TG searches (<30 msgs): Tool returns message cards - summarize what was found
+7. If tool returns empty, answer from your general knowledge
+8. Never leave response empty - always be helpful
 
 **CRITICAL QUERY LOGIC for search_knowledge_base:**
 - Use query='*' when user wants ALL messages in time period (digests, summaries, overviews)

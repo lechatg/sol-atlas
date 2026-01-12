@@ -2,11 +2,14 @@
 luka_bot entry point
 """
 import asyncio
+import os
+import socket
+from contextlib import suppress
 from loguru import logger
 
 # luka_bot core
 from luka_bot.core.config import settings
-from luka_bot.core.loader import app, bot, dp
+from luka_bot.core.loader import app, bot, dp, redis_client
 
 # handlers
 from luka_bot.handlers import get_llm_bot_router
@@ -19,10 +22,17 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiohttp import web
 from luka_bot.handlers.metrics import MetricsView
 from luka_bot.middlewares.prometheus import prometheus_middleware_factory
+from aiogram.exceptions import TelegramConflictError
 
 # Global metrics server state (for polling mode)
 _metrics_server_task = None
 _metrics_runner = None
+
+# Polling lock state
+_POLLING_LOCK_KEY = f"luka_bot:polling_lock:{settings.BOT_TOKEN[:8]}"
+_POLLING_LOCK_TTL = 90
+_polling_lock_task = None
+_polling_lock_owner = None
 
 
 async def start_metrics_server() -> None:
@@ -90,9 +100,121 @@ async def stop_metrics_server() -> None:
         logger.error(f"❌ Failed to stop metrics server: {e}", exc_info=True)
 
 
+async def _refresh_polling_lock(owner_id: str) -> None:
+    """Background task that refreshes the polling lock TTL while the process is alive."""
+    try:
+        while True:
+            await asyncio.sleep(_POLLING_LOCK_TTL / 2)
+            current_owner = await redis_client.get(_POLLING_LOCK_KEY)
+            if current_owner is None:
+                logger.warning("⚠️ Polling lock unexpectedly missing; stopping refresh task")
+                return
+            current_owner = current_owner.decode() if isinstance(current_owner, (bytes, bytearray)) else str(current_owner)
+            if current_owner != owner_id:
+                logger.warning("⚠️ Polling lock ownership changed; stopping refresh task")
+                return
+            await redis_client.expire(_POLLING_LOCK_KEY, _POLLING_LOCK_TTL)
+    except asyncio.CancelledError:
+        logger.debug("Polling lock refresh task cancelled")
+    except Exception as exc:
+        logger.error(f"❌ Error refreshing polling lock: {exc}", exc_info=True)
+
+
+async def acquire_polling_lock() -> bool:
+    """Acquire a Redis-backed lock to ensure only one polling instance runs."""
+    if not settings.POLLING_LOCK_ENABLED:
+        logger.debug("ℹ️  Polling lock disabled (POLLING_LOCK_ENABLED=False), skipping lock acquisition")
+        return True
+    
+    global _polling_lock_task, _polling_lock_owner
+    
+    owner_id = f"{socket.gethostname()}:{os.getpid()}"
+    try:
+        acquired = await redis_client.set(
+            _POLLING_LOCK_KEY,
+            owner_id,
+            ex=_POLLING_LOCK_TTL,
+            nx=True,
+        )
+        if not acquired:
+            existing = await redis_client.get(_POLLING_LOCK_KEY)
+            existing_id = existing.decode() if isinstance(existing, (bytes, bytearray)) else existing
+            logger.error(
+                "❌ Another luka_bot instance is already polling Telegram updates.\n"
+                f"   Current owner: {existing_id}"
+            )
+            return False
+        
+        _polling_lock_owner = owner_id
+        _polling_lock_task = asyncio.create_task(_refresh_polling_lock(owner_id))
+        logger.info(f"🔐 Acquired polling lock as {owner_id}")
+        return True
+    except Exception as exc:
+        logger.error(f"❌ Failed to acquire polling lock: {exc}", exc_info=True)
+        return False
+
+
+async def release_polling_lock() -> None:
+    """Release the polling lock if this instance owns it."""
+    if not settings.POLLING_LOCK_ENABLED:
+        return  # Lock is disabled, nothing to release
+    
+    global _polling_lock_task, _polling_lock_owner
+    
+    if _polling_lock_task:
+        _polling_lock_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _polling_lock_task
+        _polling_lock_task = None
+    
+    if not _polling_lock_owner:
+        return
+    
+    try:
+        current_owner = await redis_client.get(_POLLING_LOCK_KEY)
+        if current_owner is not None:
+            current_owner = current_owner.decode() if isinstance(current_owner, (bytes, bytearray)) else current_owner
+            if current_owner == _polling_lock_owner:
+                await redis_client.delete(_POLLING_LOCK_KEY)
+                logger.info("🔓 Released polling lock")
+    except Exception as exc:
+        logger.error(f"⚠️ Failed to release polling lock cleanly: {exc}", exc_info=True)
+    finally:
+        _polling_lock_owner = None
+
+
 async def on_startup() -> None:
     """Bot startup initialization."""
     logger.info("🚀 luka_bot starting...")
+    
+    # Clear workflow validation cache to ensure fresh validation on startup
+    try:
+        from luka_bot.core.loader import redis_client
+        # Clear validation cache (correct key pattern without 'luka:' prefix)
+        keys = await redis_client.keys("workflow_validation:*")
+        if keys:
+            deleted_count = await redis_client.delete(*keys)
+            logger.info(f"🧹 Cleared {deleted_count} workflow validation cache entries from Redis")
+        else:
+            logger.debug("🧹 No workflow validation cache entries in Redis to clear")
+        
+        # Also clear any workflow definition cache keys
+        def_keys = await redis_client.keys("workflow_definition:*")
+        if def_keys:
+            def_deleted = await redis_client.delete(*def_keys)
+            logger.info(f"🧹 Cleared {def_deleted} workflow definition cache entries from Redis")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to clear workflow validation cache: {e}")
+    
+    # Force workflow discovery service to reinitialize to pick up config changes
+    try:
+        from luka_bot.services import workflow_discovery_service
+        # Clear the singleton to force reinitialization
+        if hasattr(workflow_discovery_service, '_workflow_discovery_service'):
+            workflow_discovery_service._workflow_discovery_service = None
+            logger.info("🧹 Cleared workflow discovery singleton cache")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to clear workflow discovery singleton: {e}")
     
     # Initialize and check LLM providers
     try:
@@ -131,7 +253,38 @@ async def on_startup() -> None:
         
     except Exception as e:
         logger.warning(f"⚠️  Failed to initialize LLM providers: {e}")
-    
+
+    # Validate public KB configuration for guest users
+    public_kbs = settings.public_knowledge_bases
+    if public_kbs:
+        logger.info(f"📚 Public KB configured: {public_kbs} ({len(public_kbs)} indices)")
+
+        if not settings.ELASTICSEARCH_ENABLED:
+            logger.warning("⚠️  Public KB configured but Elasticsearch is disabled!")
+            logger.warning("   Set ELASTICSEARCH_ENABLED=true to enable KB features")
+        else:
+            try:
+                from luka_bot.services.elasticsearch_service import get_elasticsearch_service
+                es_service = await get_elasticsearch_service()
+
+                # Validate each index
+                for index_name in public_kbs:
+                    exists = await es_service.index_exists(index_name)
+
+                    if exists:
+                        logger.info(f"✅ Public KB index verified: {index_name}")
+                    else:
+                        logger.warning(f"⚠️  Public KB index not found: {index_name}")
+                        logger.warning(f"   Guest users won't have access to this KB")
+                        logger.warning(f"   Create index: curl -X PUT '{settings.ELASTICSEARCH_URL}/{index_name}'")
+
+            except Exception as e:
+                logger.warning(f"⚠️  Failed to validate public KB indices: {e}")
+    else:
+        logger.info("📚 Public KB not configured (LUKA_PUBLIC_KNOWLEDGE_BASE empty)")
+        logger.info("   Guest users will use personal KB indices")
+
+
     # Register middlewares (ORDER MATTERS!)
     # 1. Password gate FIRST (if enabled, blocks unauthenticated users)
     if settings.LUKA_PASSWORD_ENABLED:
@@ -197,6 +350,58 @@ async def on_startup() -> None:
     else:
         logger.info("ℹ️  Camunda integration disabled (CAMUNDA_ENABLED=False)")
         logger.info("   Process-based features will not be available")
+
+    # Initialize workflow service for dialog workflows
+    try:
+        from luka_bot.services.workflow_service import get_workflow_service
+        workflow_service = get_workflow_service()
+        initialized = await workflow_service.initialize()
+        
+        if initialized:
+            available_workflows = await workflow_service.get_available_workflows()
+            logger.info(f"✅ WorkflowService initialized with {len(available_workflows)} workflow(s)")
+            
+            if available_workflows:
+                domains = [w.domain for w in available_workflows]
+                logger.info(f"   Available workflow domains: {', '.join(domains)}")
+            else:
+                logger.warning("⚠️  No workflows discovered - check workflow directories and config.yaml files")
+            
+            # Log validation errors if any
+            from luka_bot.services.workflow_discovery_service import get_workflow_discovery_service
+            discovery_service = get_workflow_discovery_service()
+            validation_errors = discovery_service.get_validation_errors()
+            
+            if validation_errors:
+                logger.warning(f"⚠️  Found validation issues in {len(validation_errors)} workflow(s):")
+                for domain, errors in validation_errors.items():
+                    error_count = len([e for e in errors if e.get("level") == "error"])
+                    warning_count = len([e for e in errors if e.get("level") == "warning"])
+                    if error_count > 0:
+                        logger.error(f"   ❌ {domain}: {error_count} errors, {warning_count} warnings")
+                        # Log detailed errors in debug mode
+                        try:
+                            log_level = logger._core.min_level if hasattr(logger, '_core') else 20
+                            if log_level <= 10:  # DEBUG level
+                                formatted = discovery_service._validation_service.format_validation_errors(errors)
+                                if formatted:
+                                    logger.debug(f"      Validation details for {domain}:\n{formatted}")
+                        except (AttributeError, TypeError):
+                            # Fallback: try to format anyway
+                            try:
+                                formatted = discovery_service._validation_service.format_validation_errors(errors)
+                                if formatted:
+                                    logger.debug(f"      Validation details for {domain}:\n{formatted}")
+                            except Exception:
+                                pass
+                    elif warning_count > 0:
+                        logger.warning(f"   ⚠️  {domain}: {warning_count} warnings")
+        else:
+            logger.warning("⚠️  WorkflowService initialization failed - workflows will not be available")
+            
+    except Exception as e:
+        logger.warning(f"⚠️  Failed to initialize workflow service: {e}")
+        logger.info("   Bot will continue without dialog workflow features")
 
     # Register handlers
     dp.include_router(get_llm_bot_router())
@@ -323,6 +528,10 @@ async def on_shutdown() -> None:
         except Exception as e:
             logger.warning(f"⚠️  Error stopping AG-UI server: {e}")
     
+    # Release polling lock on shutdown
+    if not settings.USE_WEBHOOK:
+        await release_polling_lock()
+    
     # Close bot session
     await bot.session.close()
     
@@ -346,12 +555,12 @@ async def setup_webhook() -> None:
     # 2. Webhook handler (specific: /webhook or configured path)
     # 3. AG-UI catch-all (last: /* catches everything else)
 
-    # Step 1: Initialize AG-UI (starts internal server, returns proxy handler)
-    ag_ui_proxy_handler = None
+    # Step 1: Initialize AG-UI (starts internal server, returns proxy handlers)
+    ag_ui_handlers = None
     if settings.AG_UI_ENABLED:
         logger.info("🔧 Initializing AG-UI Gateway...")
         from luka_bot.core.ag_ui_integration import mount_ag_ui_on_webhook
-        ag_ui_proxy_handler = await mount_ag_ui_on_webhook(app)
+        ag_ui_handlers = await mount_ag_ui_on_webhook(app)
 
     # Step 2: Setup metrics endpoint (specific route)
     if settings.METRICS_ENABLED:
@@ -380,10 +589,24 @@ async def setup_webhook() -> None:
     # Step 4: Setup aiogram application lifecycle
     setup_application(app, dp, bot=bot)
 
-    # Step 5: Register AG-UI catch-all proxy LAST (after all specific routes)
-    if ag_ui_proxy_handler is not None:
-        app.router.add_route("*", "/{path_info:.*}", ag_ui_proxy_handler, name="ag_ui_proxy")
-        logger.info("✅ AG-UI catch-all proxy registered (handles all non-webhook/metrics routes)")
+    # Step 5: Register AG-UI WebSocket handler (BEFORE catch-all proxy)
+    if ag_ui_handlers is not None and isinstance(ag_ui_handlers, dict):
+        websocket_proxy = ag_ui_handlers.get("websocket_proxy")
+        http_proxy = ag_ui_handlers.get("http_proxy")
+        
+        if websocket_proxy:
+            app.router.add_route("GET", "/ws/{path_info:.*}", websocket_proxy, name="ag_ui_websocket_proxy")
+            logger.info("✅ AG-UI WebSocket proxy registered at /ws/*")
+        
+        # Step 6: Register AG-UI catch-all HTTP proxy LAST (after all specific routes)
+        if http_proxy:
+            app.router.add_route("*", "/{path_info:.*}", http_proxy, name="ag_ui_proxy")
+            logger.info("✅ AG-UI catch-all HTTP proxy registered (handles all non-webhook/metrics/ws routes)")
+            logger.info("📌 Route priority: /metrics → /webhook → /ws/* → /* (AG-UI)")
+    elif ag_ui_handlers is not None:
+        # Backward compatibility: if old format (single handler) is returned
+        app.router.add_route("*", "/{path_info:.*}", ag_ui_handlers, name="ag_ui_proxy")
+        logger.info("✅ AG-UI catch-all proxy registered (legacy mode)")
         logger.info("📌 Route priority: /metrics → /webhook → /* (AG-UI)")
 
     # Log all registered routes for verification
@@ -427,7 +650,18 @@ async def main() -> None:
         # Delete webhook and start polling (Phase 1)
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("📡 Using polling mode")
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        
+        if not await acquire_polling_lock():
+            logger.error("Exiting because polling lock could not be acquired.")
+            return
+        
+        try:
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        except TelegramConflictError as conflict_error:
+            logger.error(f"❌ Telegram conflict while polling: {conflict_error}")
+            logger.error("   Another process may still be polling. Exiting.")
+        finally:
+            await release_polling_lock()
 
 
 if __name__ == "__main__":

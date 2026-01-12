@@ -32,6 +32,13 @@ class ModerationPromptEditForm(StatesGroup):
     settings_id = State()
 
 
+# FSM States for bot personality editing
+class BotPersonalityEditForm(StatesGroup):
+    """FSM states for editing bot personality (group_bot_prompt)."""
+    waiting_for_prompt = State()
+    settings_id = State()
+
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -1244,6 +1251,59 @@ async def handle_toggle_ai_assistant(callback: CallbackQuery):
         await callback.answer("❌ Error", show_alert=True)
 
 
+@router.callback_query(F.data.startswith("group_toggle_respond_all:"))
+async def handle_toggle_respond_to_all(callback: CallbackQuery):
+    """Toggle respond to all messages - works for BOTH groups AND user defaults!"""
+    try:
+        id = int(callback.data.split(":")[1])
+        user_id = callback.from_user.id
+        
+        if id < 0:
+            is_admin = await is_user_admin_in_group(callback.bot, id, user_id)
+            if not is_admin:
+                await callback.answer("🔒 Admin only", show_alert=True)
+                return
+        
+        from luka_bot.handlers.groups_enhanced import get_settings_for_id
+        from luka_bot.services.moderation_service import get_moderation_service
+        moderation_service = await get_moderation_service()
+        settings = await get_settings_for_id(id)
+        
+        if not settings:
+            await callback.answer("⚠️ Settings not found", show_alert=True)
+            return
+        
+        # Only allow toggle if AI assistant is enabled
+        if not settings.ai_assistant_enabled:
+            await callback.answer("⚠️ Enable AI Assistant first", show_alert=True)
+            return
+        
+        settings.respond_to_all_messages = not settings.respond_to_all_messages
+        settings.updated_at = datetime.utcnow()
+        await moderation_service.save_group_settings(settings)
+
+        if id > 0:
+            from luka_bot.utils.i18n_helper import get_user_language
+            lang = await get_user_language(user_id)
+        else:
+            from luka_bot.services.group_service import get_group_service
+            group_service = await get_group_service()
+            lang = await group_service.get_group_language(id)
+
+        await _render_ai_assistant_menu(callback, id, user_id)
+
+        if settings.respond_to_all_messages:
+            message = "💬 Responding to all messages" if lang != "ru" else "💬 Ответ на все сообщения"
+        else:
+            message = "📝 Only mentions/replies" if lang != "ru" else "📝 Только упоминания/ответы"
+
+        await callback.answer(message)
+
+    except Exception as e:
+        logger.error(f"Failed to toggle respond to all: {e}")
+        await callback.answer("❌ Error", show_alert=True)
+
+
 @router.callback_query(F.data.startswith("group_toggle_kb:"))
 async def handle_toggle_kb_indexation(callback: CallbackQuery):
     """Toggle KB indexation - works for BOTH groups AND user defaults!"""
@@ -1297,6 +1357,54 @@ async def handle_toggle_kb_indexation(callback: CallbackQuery):
         await callback.answer("❌ Error", show_alert=True)
 
 
+@router.callback_query(F.data.startswith("group_toggle_manual_kb:"))
+async def handle_toggle_manual_kb_gathering(callback: CallbackQuery):
+    """Toggle Manual KB Gathering - works for BOTH groups AND user defaults!"""
+    try:
+        id = int(callback.data.split(":")[1])
+        user_id = callback.from_user.id
+        
+        if id < 0:
+            is_admin = await is_user_admin_in_group(callback.bot, id, user_id)
+            if not is_admin:
+                await callback.answer("🔒 Admin only", show_alert=True)
+                return
+        
+        from luka_bot.handlers.groups_enhanced import get_settings_for_id
+        from luka_bot.services.moderation_service import get_moderation_service
+        moderation_service = await get_moderation_service()
+        settings = await get_settings_for_id(id)
+        
+        if not settings:
+            await callback.answer("⚠️ Settings not found", show_alert=True)
+            return
+        
+        settings.manual_kb_gathering_enabled = not settings.manual_kb_gathering_enabled
+        settings.updated_at = datetime.utcnow()
+        await moderation_service.save_group_settings(settings)
+
+        if id > 0:
+            from luka_bot.utils.i18n_helper import get_user_language
+            lang = await get_user_language(user_id)
+        else:
+            from luka_bot.services.group_service import get_group_service
+            group_service = await get_group_service()
+            lang = await group_service.get_group_language(id)
+
+        await _render_ai_assistant_menu(callback, id, user_id)
+
+        if settings.manual_kb_gathering_enabled:
+            message = "➕ Manual adding to KB enabled" if lang != "ru" else "➕ Ручное добавление в БЗ включено"
+        else:
+            message = "➕ Manual adding to KB disabled" if lang != "ru" else "➕ Ручное добавление в БЗ отключено"
+
+        await callback.answer(message)
+
+    except Exception as e:
+        logger.error(f"Failed to toggle manual KB gathering: {e}")
+        await callback.answer("❌ Error", show_alert=True)
+
+
 @router.callback_query(F.data.startswith("ai_assistant_menu:"))
 async def handle_ai_assistant_menu(callback: CallbackQuery):
     """Show AI Assistant submenu with ON/OFF toggles."""
@@ -1344,7 +1452,9 @@ async def _render_ai_assistant_menu(callback: CallbackQuery, settings_id: int, u
     keyboard = create_ai_assistant_menu(
         settings_id,
         settings.ai_assistant_enabled,
+        settings.respond_to_all_messages,
         settings.kb_indexation_enabled,
+        settings.manual_kb_gathering_enabled,
         lang
     )
 
@@ -1804,6 +1914,9 @@ async def handle_moderation_prompt_edit(callback: CallbackQuery, state: FSMConte
         await state.update_data(settings_id=id)
         await state.set_state(ModerationPromptEditForm.waiting_for_prompt)
         
+        # Log FSM state for debugging (can be removed once stable)
+        logger.debug(f"FSM state set: ModerationPromptEditForm, settings_id={id}")
+        
         # Get current prompt or show default message
         current_prompt = settings.moderation_prompt
         
@@ -2101,6 +2214,341 @@ async def handle_moderation_prompt_reset(callback: CallbackQuery):
 
 
 # ============================================================================
+# Bot Personality (group_bot_prompt) Handlers
+# ============================================================================
+
+@router.callback_query(F.data.startswith("bot_personality_menu:"))
+async def handle_bot_personality_menu(callback: CallbackQuery):
+    """Show bot personality menu - customize how bot responds in this group."""
+    try:
+        id = int(callback.data.split(":")[1])
+        user_id = callback.from_user.id
+        
+        # Check admin for groups
+        if id < 0:  # Group
+            is_admin = await is_user_admin_in_group(callback.bot, id, user_id)
+            if not is_admin:
+                await callback.answer("🔒 Admin only", show_alert=True)
+                return
+        
+        # Get settings
+        from luka_bot.handlers.groups_enhanced import get_settings_for_id
+        settings = await get_settings_for_id(id)
+        
+        if not settings:
+            await callback.answer("⚠️ Settings not found", show_alert=True)
+            return
+        
+        # Get language
+        from luka_bot.services.group_service import get_group_service
+        group_service = await get_group_service()
+        if id > 0:
+            from luka_bot.utils.i18n_helper import get_user_language
+            lang = await get_user_language(user_id)
+        else:
+            lang = await group_service.get_group_language(id)
+        
+        # Build text
+        text = f"""<b>{_('user_group_defaults.bot_personality_title', lang)}</b>
+
+{_('user_group_defaults.bot_personality_desc', lang)}
+
+<b>{_('user_group_defaults.current_personality', lang)}:</b>"""
+        
+        if settings.group_bot_prompt:
+            text += f"\n\n<code>{settings.group_bot_prompt[:500]}</code>"
+            if len(settings.group_bot_prompt) > 500:
+                text += "..."
+        else:
+            text += f"\n\n<i>{_('user_group_defaults.using_default_personality', lang)}</i>"
+        
+        # Create keyboard
+        buttons = []
+        
+        # View full prompt
+        if settings.group_bot_prompt:
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"👁️ {_('user_group_defaults.view_full_prompt', lang)}",
+                    callback_data=f"bot_personality_view:{id}"
+                )
+            ])
+        
+        # Edit prompt
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"✏️ {_('user_group_defaults.edit_prompt', lang)}",
+                callback_data=f"bot_personality_edit:{id}"
+            )
+        ])
+        
+        # Reset to default (if custom prompt exists)
+        if settings.group_bot_prompt:
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🔄 {_('user_group_defaults.reset_to_default', lang)}",
+                    callback_data=f"bot_personality_reset:{id}"
+                )
+            ])
+        
+        # Back button - return to AI Assistant menu
+        buttons.append([
+            InlineKeyboardButton(
+                text=_('common.back', lang),
+                callback_data=f"ai_assistant_menu:{id}"
+            )
+        ])
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Failed to show bot personality menu: {e}")
+        await callback.answer("❌ Error", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("bot_personality_view:"))
+async def handle_bot_personality_view(callback: CallbackQuery):
+    """Send the full bot personality prompt to the user."""
+    try:
+        settings_id = int(callback.data.split(":", 1)[1])
+        user_id = callback.from_user.id
+
+        # Check permissions
+        if settings_id < 0:
+            is_admin = await is_user_admin_in_group(callback.bot, settings_id, user_id)
+            if not is_admin:
+                await callback.answer("🔒 Admin only", show_alert=True)
+                return
+
+        from luka_bot.handlers.groups_enhanced import get_settings_for_id
+        settings = await get_settings_for_id(settings_id)
+
+        if not settings or not settings.group_bot_prompt:
+            await callback.answer("⚠️ No custom personality set", show_alert=True)
+            return
+
+        prompt = settings.group_bot_prompt
+        escaped_prompt = html.escape(prompt)
+
+        header = "🎭 <b>Full Bot Personality:</b>\n\n"
+        await callback.message.answer(f"{header}<code>{escaped_prompt}</code>", parse_mode="HTML")
+        await callback.answer("📄 Personality sent below")
+
+    except Exception as e:
+        logger.error(f"Failed to show full bot personality: {e}")
+        await callback.answer("❌ Error", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("bot_personality_edit:"))
+async def handle_bot_personality_edit(callback: CallbackQuery, state: FSMContext):
+    """Start editing bot personality."""
+    try:
+        id = int(callback.data.split(":")[1])
+        user_id = callback.from_user.id
+        
+        # Check admin for groups
+        if id < 0:
+            is_admin = await is_user_admin_in_group(callback.bot, id, user_id)
+            if not is_admin:
+                await callback.answer("🔒 Admin only", show_alert=True)
+                return
+        
+        # Get current settings
+        from luka_bot.handlers.groups_enhanced import get_settings_for_id
+        settings = await get_settings_for_id(id)
+        
+        if not settings:
+            await callback.answer("⚠️ Settings not found", show_alert=True)
+            return
+        
+        # Get language
+        if id > 0:
+            from luka_bot.utils.i18n_helper import get_user_language
+            lang = await get_user_language(user_id)
+        else:
+            from luka_bot.services.group_service import get_group_service
+            group_service = await get_group_service()
+            lang = await group_service.get_group_language(id)
+        
+        # Store ID in FSM
+        await state.update_data(settings_id=id)
+        await state.set_state(BotPersonalityEditForm.waiting_for_prompt)
+        
+        # Get current prompt
+        current_prompt = settings.group_bot_prompt
+        
+        # Build edit message using localization
+        title = _('user_group_defaults.edit_personality_title', lang)
+        send_new = _('user_group_defaults.edit_personality_send_new', lang)
+        examples = _('user_group_defaults.personality_examples', lang)
+        cancel = _('user_group_defaults.edit_personality_cancel', lang)
+        
+        if current_prompt:
+            current_label = _('user_group_defaults.edit_personality_current', lang)
+            truncated = current_prompt[:500] + ("..." if len(current_prompt) > 500 else "")
+            text = f"""{title}
+
+{send_new}
+
+{current_label}
+<code>{truncated}</code>
+
+{examples}
+
+{cancel}"""
+        else:
+            using_default = _('user_group_defaults.edit_personality_using_default', lang)
+            text = f"""{title}
+
+{send_new}
+
+{using_default}
+
+{examples}
+
+{cancel}"""
+        
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Failed to start bot personality edit: {e}")
+        await callback.answer("❌ Error", show_alert=True)
+
+
+@router.message(BotPersonalityEditForm.waiting_for_prompt, F.text)
+async def handle_bot_personality_input(message: Message, state: FSMContext):
+    """Handle bot personality input."""
+    try:
+        # Get ID from FSM
+        data = await state.get_data()
+        id = data.get("settings_id")
+        
+        if not id:
+            await message.reply("❌ Session expired. Please try again.")
+            await state.clear()
+            return
+        
+        # Get language
+        if id > 0:
+            from luka_bot.utils.i18n_helper import get_user_language
+            lang = await get_user_language(message.from_user.id)
+        else:
+            from luka_bot.services.group_service import get_group_service
+            group_service = await get_group_service()
+            lang = await group_service.get_group_language(id)
+        
+        # Check for cancel
+        if message.text.lower().strip() == "/cancel":
+            await state.clear()
+            cancel_msg = "❌ Cancelled" if lang == "en" else "❌ Отменено"
+            await message.reply(cancel_msg)
+            return
+        
+        # Verify admin for groups
+        if id < 0:
+            is_admin = await is_user_admin_in_group(message.bot, id, message.from_user.id)
+            if not is_admin:
+                await message.reply("🔒 You must be an admin")
+                await state.clear()
+                return
+        
+        # Validate length (max 1000 chars recommended)
+        if len(message.text) > 2000:
+            await message.reply("⚠️ Personality is too long (max 2000 characters). Please shorten it.")
+            return
+        
+        # Update prompt
+        from luka_bot.services.moderation_service import get_moderation_service
+        from luka_bot.handlers.groups_enhanced import get_settings_for_id
+        
+        moderation_service = await get_moderation_service()
+        settings = await get_settings_for_id(id)
+        
+        if not settings:
+            await message.reply("⚠️ Settings not found")
+            await state.clear()
+            return
+        
+        settings.group_bot_prompt = message.text.strip()
+        settings.updated_at = datetime.utcnow()
+        await moderation_service.save_group_settings(settings)
+        
+        # Clear FSM
+        await state.clear()
+        
+        # Send confirmation
+        if lang == "en":
+            confirmation = f"""✅ <b>Bot Personality Updated!</b>
+
+Your custom personality has been saved.
+
+<b>Preview:</b>
+<code>{message.text[:200]}</code>{"..." if len(message.text) > 200 else ""}
+
+The bot will now use this style when responding in this group."""
+        else:
+            confirmation = f"""✅ <b>Личность бота обновлена!</b>
+
+Ваша пользовательская личность сохранена.
+
+<b>Предпросмотр:</b>
+<code>{message.text[:200]}</code>{"..." if len(message.text) > 200 else ""}
+
+Бот теперь будет использовать этот стиль при ответах в этой группе."""
+        
+        await message.reply(confirmation, parse_mode="HTML")
+        
+    except Exception as e:
+        logger.error(f"Failed to update bot personality: {e}")
+        await message.reply(f"❌ Error: {e}")
+        await state.clear()
+
+
+@router.callback_query(F.data.startswith("bot_personality_reset:"))
+async def handle_bot_personality_reset(callback: CallbackQuery):
+    """Reset bot personality to default."""
+    try:
+        id = int(callback.data.split(":")[1])
+        user_id = callback.from_user.id
+        
+        # Check admin for groups
+        if id < 0:
+            is_admin = await is_user_admin_in_group(callback.bot, id, user_id)
+            if not is_admin:
+                await callback.answer("🔒 Admin only", show_alert=True)
+                return
+        
+        # Reset personality
+        from luka_bot.services.moderation_service import get_moderation_service
+        from luka_bot.handlers.groups_enhanced import get_settings_for_id
+        
+        moderation_service = await get_moderation_service()
+        settings = await get_settings_for_id(id)
+        
+        if not settings:
+            await callback.answer("⚠️ Settings not found", show_alert=True)
+            return
+        
+        settings.group_bot_prompt = None  # Reset to None (will use default)
+        settings.updated_at = datetime.utcnow()
+        await moderation_service.save_group_settings(settings)
+        
+        await callback.answer("✅ Reset to default personality")
+        
+        # Refresh the personality menu
+        callback.data = f"bot_personality_menu:{id}"
+        await handle_bot_personality_menu(callback)
+        
+    except Exception as e:
+        logger.error(f"Failed to reset bot personality: {e}")
+        await callback.answer("❌ Error", show_alert=True)
+
+
+# ============================================================================
 # User Defaults: Reset to Factory Defaults
 # ============================================================================
 
@@ -2242,6 +2690,7 @@ async def handle_group_reset_to_user_defaults(callback: CallbackQuery):
         group_settings.moderation_enabled = user_defaults.moderation_enabled
         group_settings.silent_mode = user_defaults.silent_mode
         group_settings.ai_assistant_enabled = user_defaults.ai_assistant_enabled
+        group_settings.respond_to_all_messages = user_defaults.respond_to_all_messages
         group_settings.kb_indexation_enabled = user_defaults.kb_indexation_enabled
         group_settings.moderate_admins_enabled = user_defaults.moderate_admins_enabled
         group_settings.moderation_prompt = user_defaults.moderation_prompt

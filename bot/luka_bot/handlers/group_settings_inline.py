@@ -72,6 +72,7 @@ async def handle_group_moderation_toggle(callback: CallbackQuery):
         is_dm = callback.message.chat.type == "private"
         
         if is_dm:
+            from luka_bot.handlers.group_admin import _render_moderation_menu
             await _render_moderation_menu(callback, id, user_id)
         else:
             from luka_bot.keyboards.group_settings_inline import create_group_settings_inline
@@ -406,7 +407,8 @@ Be warm, natural, and conversational. You are {bot_name}."""
             )
             
             # Generate LLM response
-            agent = await create_static_agent_with_basic_tools(callback.from_user.id)
+            # Use default enabled tools for settings
+            agent = await create_static_agent_with_basic_tools(callback.from_user.id, enabled_tools=None)
             result = await agent.run(llm_prompt, deps=ctx)
             
             # Extract text from AgentRunResult
@@ -754,4 +756,3 @@ Users who posted in this group can now see it in their /groups menu and search t
     except Exception as e:
         logger.error(f"❌ Error handling backfill: {e}")
         await callback.answer("❌ Error running backfill", show_alert=True)
-

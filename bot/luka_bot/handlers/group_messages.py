@@ -5,6 +5,7 @@ Handles messages in Telegram groups where the bot is added,
 indexing them to the group's KB for searchability.
 """
 import asyncio
+from io import BytesIO
 from aiogram import Router, F
 from aiogram.types import Message, ChatMemberUpdated
 from aiogram.filters import ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
@@ -15,6 +16,11 @@ from datetime import datetime
 from luka_bot.services.group_service import get_group_service
 from luka_bot.services.elasticsearch_service import get_elasticsearch_service
 from luka_bot.services.moderation_service import get_moderation_service
+from luka_bot.services.messaging_service import (
+    TELEGRAM_LIMIT,
+    edit_and_send_parts,
+    send_long_message,
+)
 from luka_bot.utils.message_parser import extract_mentions, extract_hashtags, extract_urls
 from luka_bot.utils.content_detection import (
     check_stoplist,
@@ -40,7 +46,15 @@ async def handle_bot_added_to_group(event: ChatMemberUpdated) -> None:
         group_title = event.chat.title or f"Group {group_id}"
         group_username = event.chat.username
         
-        logger.info(f"🎉 Bot added to group {group_id} ({group_title}) by user {user_id}")
+        # Skip onboarding message if this is a private chat (user blocking/unblocking bot)
+        is_private_chat = event.chat.type == "private"
+        if is_private_chat:
+            logger.info(f"💬 Private chat detected (user {user_id} started/unblocked bot) - skipping group onboarding message")
+            # Still allow setup to continue (group link, settings, etc.) but skip welcome message
+            skip_group_onboarding = True
+        else:
+            skip_group_onboarding = False
+            logger.info(f"🎉 Bot added to group {group_id} ({group_title}) by user {user_id}")
         
         # Determine user role
         user_role = "member"
@@ -120,64 +134,68 @@ async def handle_bot_added_to_group(event: ChatMemberUpdated) -> None:
         await group_service.cache_group_metadata(metadata)
         logger.info(f"✅ Cached metadata for group {group_id}")
         
-        # Generate smart welcome message based on bot permissions
-        from luka_bot.utils.welcome_generator import generate_smart_welcome_message
-        
-        welcome_text = generate_smart_welcome_message(
-            bot_name=bot_name,
-            metadata=metadata,
-            thread=thread,
-            language=group_language
-        )
-        
-        # Create inline keyboard with settings
-        from luka_bot.keyboards.group_settings_inline import create_group_settings_inline
-        moderation_enabled = group_settings.moderation_enabled if group_settings else False
-        inline_keyboard = create_group_settings_inline(group_id, group_language, moderation_enabled)
-        
-        # Check silent mode setting - this only affects GROUP messages, not DMs
-        if silent_mode:
-            # SILENT MODE: Don't send welcome in group, send DM to admin instead
-            logger.info(f"🔇 Silent mode ON - sending welcome to admin DM instead of group")
+        # Skip group onboarding message for private chats (user starting/unblocking bot)
+        if skip_group_onboarding:
+            logger.info(f"⏭️ Skipping group onboarding message for private chat {group_id}")
+        else:
+            # Generate smart welcome message based on bot permissions
+            from luka_bot.utils.welcome_generator import generate_smart_welcome_message
             
-            # Send welcome message + controls to user's DM
-            from luka_bot.utils.group_onboarding import send_group_onboarding_to_dm
-            
-            await send_group_onboarding_to_dm(
-                bot=event.bot,
-                user_id=user_id,
-                group_id=group_id,
-                group_title=group_title,
-                welcome_text=welcome_text,
-                inline_keyboard=inline_keyboard,
+            welcome_text = generate_smart_welcome_message(
+                bot_name=bot_name,
                 metadata=metadata,
                 thread=thread,
                 language=group_language
             )
-            logger.info(f"✅ Sent silent mode welcome to user {user_id} DM")
-        else:
-            # NORMAL MODE: Send welcome message in group
-            await event.answer(welcome_text, reply_markup=inline_keyboard, parse_mode="HTML")
-            logger.info(f"✅ Sent smart welcome message to group (bot_is_admin={metadata.bot_is_admin})")
-        
-        # ========================================================================
-        # Note: Notification is now included in the welcome message above
-        # No need for separate notification message
-        # ========================================================================
-        
-        # Get LLM-generated personalized welcome ONLY if AI assistant is enabled AND silent mode is OFF
-        if not silent_mode and group_settings.ai_assistant_enabled:
-            try:
-                from luka_bot.services.llm_service import get_llm_service
-                llm_service = get_llm_service()
+            
+            # Create inline keyboard with settings
+            from luka_bot.keyboards.group_settings_inline import create_group_settings_inline
+            moderation_enabled = group_settings.moderation_enabled if group_settings else False
+            inline_keyboard = create_group_settings_inline(group_id, group_language, moderation_enabled)
+            
+            # Check silent mode setting - this only affects GROUP messages, not DMs
+            if silent_mode:
+                # SILENT MODE: Don't send welcome in group, send DM to admin instead
+                logger.info(f"🔇 Silent mode ON - sending welcome to admin DM instead of group")
                 
-                # Create a prompt for the LLM using bot personality from settings
-                # Include language instruction based on group settings
-                language_instruction = ""
-                if group_language == "ru":
-                    language_instruction = "\n\nIMPORTANT: Write your response in Russian language (русский язык)."
+                # Send welcome message + controls to user's DM
+                from luka_bot.utils.group_onboarding import send_group_onboarding_to_dm
                 
-                llm_prompt = f"""You are {settings.LUKA_NAME}. You've just been added to a Telegram group called "{group_title}".
+                await send_group_onboarding_to_dm(
+                    bot=event.bot,
+                    user_id=user_id,
+                    group_id=group_id,
+                    group_title=group_title,
+                    welcome_text=welcome_text,
+                    inline_keyboard=inline_keyboard,
+                    metadata=metadata,
+                    thread=thread,
+                    language=group_language
+                )
+                logger.info(f"✅ Sent silent mode welcome to user {user_id} DM")
+            else:
+                # NORMAL MODE: Send welcome message in group
+                await event.answer(welcome_text, reply_markup=inline_keyboard, parse_mode="HTML")
+                logger.info(f"✅ Sent smart welcome message to group (bot_is_admin={metadata.bot_is_admin})")
+            
+            # ========================================================================
+            # Note: Notification is now included in the welcome message above
+            # No need for separate notification message
+            # ========================================================================
+            
+            # Get LLM-generated personalized welcome ONLY if AI assistant is enabled AND silent mode is OFF
+            if not silent_mode and group_settings.ai_assistant_enabled:
+                try:
+                    from luka_bot.services.llm_service import get_llm_service
+                    llm_service = get_llm_service()
+                    
+                    # Create a prompt for the LLM using bot personality from settings
+                    # Include language instruction based on group settings
+                    language_instruction = ""
+                    if group_language == "ru":
+                        language_instruction = "\n\nIMPORTANT: Write your response in Russian language (русский язык)."
+                    
+                    llm_prompt = f"""You are {settings.LUKA_NAME}. You've just been added to a Telegram group called "{group_title}".
 
 Write a SHORT (2-3 sentences max), friendly welcome message that:
 - Greets the group members warmly
@@ -186,48 +204,49 @@ Write a SHORT (2-3 sentences max), friendly welcome message that:
 - Shows personality and warmth
 
 Be conversational, brief, and friendly. No bullet points or technical details.{language_instruction}"""
-                
-                # Generate welcome from LLM (simple request, no streaming needed)
-                from luka_bot.agents.context import ConversationContext
-                
-                # Create minimal context for welcome message
-                ctx = ConversationContext(
-                    user_id=user_id,
-                    thread_id=thread.thread_id,
-                    thread_knowledge_bases=thread.knowledge_bases
-                )
-                
-                # Get agent and generate response
-                from luka_bot.agents.agent_factory import create_static_agent_with_basic_tools
-                agent = await create_static_agent_with_basic_tools(user_id)
-                
-                result = await agent.run(llm_prompt, deps=ctx)
-                
-                # Extract text from AgentRunResult properly
-                if hasattr(result, 'data'):
-                    llm_welcome = str(result.data)
-                elif hasattr(result, 'output'):
-                    llm_welcome = str(result.output)
-                else:
-                    llm_welcome = str(result)
-                
-                # Clean up the text (remove AgentRunResult wrapper if present)
-                if llm_welcome.startswith("AgentRunResult("):
-                    import re
-                    match = re.search(r"output='([^']*(?:\\.[^']*)*)'", llm_welcome)
-                    if match:
-                        llm_welcome = match.group(1).replace("\\'", "'").replace("\\n", "\n")
-                
-                # Send LLM-generated welcome (just the message, no prefix)
-                await event.answer(llm_welcome, parse_mode="HTML")
-                
-                logger.info(f"✅ Sent AI-generated welcome to group {group_id}")
-                
-            except Exception as e:
-                logger.warning(f"⚠️  Failed to generate LLM welcome: {e}")
-                # Non-critical, continue without LLM welcome
-        else:
-            logger.info(f"ℹ️ Skipped AI welcome for group {group_id} (AI assistant disabled in settings)")
+                    
+                    # Generate welcome from LLM (simple request, no streaming needed)
+                    from luka_bot.agents.context import ConversationContext
+                    
+                    # Create minimal context for welcome message
+                    ctx = ConversationContext(
+                        user_id=user_id,
+                        thread_id=thread.thread_id,
+                        thread_knowledge_bases=thread.knowledge_bases
+                    )
+                    
+                    # Get agent and generate response
+                    from luka_bot.agents.agent_factory import create_static_agent_with_basic_tools
+                    # Use default enabled tools for group messages
+                    agent = await create_static_agent_with_basic_tools(user_id, enabled_tools=None)
+                    
+                    result = await agent.run(llm_prompt, deps=ctx)
+                    
+                    # Extract text from AgentRunResult properly
+                    if hasattr(result, 'data'):
+                        llm_welcome = str(result.data)
+                    elif hasattr(result, 'output'):
+                        llm_welcome = str(result.output)
+                    else:
+                        llm_welcome = str(result)
+                    
+                    # Clean up the text (remove AgentRunResult wrapper if present)
+                    if llm_welcome.startswith("AgentRunResult("):
+                        import re
+                        match = re.search(r"output='([^']*(?:\\.[^']*)*)'", llm_welcome)
+                        if match:
+                            llm_welcome = match.group(1).replace("\\'", "'").replace("\\n", "\n")
+                    
+                    # Send LLM-generated welcome (just the message, no prefix)
+                    await event.answer(llm_welcome, parse_mode="HTML")
+                    
+                    logger.info(f"✅ Sent AI-generated welcome to group {group_id}")
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️  Failed to generate LLM welcome: {e}")
+                    # Non-critical, continue without LLM welcome
+            else:
+                logger.info(f"ℹ️ Skipped AI welcome for group {group_id} (AI assistant disabled in settings)")
         
         # Note: Admin menu is now included in the welcome message keyboard above
         # No need for separate admin menu message
@@ -321,11 +340,7 @@ async def ensure_user_group_link(
     from luka_bot.services.thread_service import get_thread_service
     thread_service = get_thread_service()
     group_thread = await thread_service.get_group_thread(group_id)
-    
-    if not group_thread:
-        logger.warning(f"⚠️ No group thread for {group_id}, skipping GroupLink creation")
-        return
-    
+
     # 4. Determine user role
     user_role = "member"  # Default
     try:
@@ -334,17 +349,52 @@ async def ensure_user_group_link(
             user_role = "admin" if member.status == "administrator" else "owner"
     except Exception as e:
         logger.debug(f"Could not get member status for user {user_id}: {e}")
-    
-    # 5. Create link
+
+    # 5. Create link (this will auto-create group thread if missing)
     group_title = message.chat.title or f"Group {group_id}"
+
+    # Get language from thread if exists, otherwise use user's default
+    group_language = "en"
+    if group_thread:
+        group_language = group_thread.language or "en"
+    else:
+        # No thread exists - get user's default language
+        logger.warning(f"⚠️ No group thread for {group_id}, will be created automatically")
+        try:
+            from luka_bot.services.moderation_service import get_moderation_service
+            moderation_service = await get_moderation_service()
+            user_defaults = await moderation_service.get_or_create_user_default_settings(user_id)
+            group_language = user_defaults.language
+        except Exception as e:
+            logger.warning(f"Could not get user language defaults: {e}")
+
     link = await group_service.create_group_link(
         user_id=user_id,
         group_id=group_id,
         group_title=group_title,
-        language=group_thread.language or "en",
+        language=group_language,
         user_role=user_role
     )
-    
+
+    # If this was a new group (no thread existed), also create group settings from user defaults
+    if not group_thread:
+        try:
+            from luka_bot.services.moderation_service import get_moderation_service
+            moderation_service = await get_moderation_service()
+
+            # Check if group settings already exist
+            existing_settings = await moderation_service.get_group_settings(group_id)
+            if not existing_settings:
+                # Create group settings from user's default template
+                group_settings = await moderation_service.create_group_settings_from_user_defaults(
+                    user_id=user_id,
+                    group_id=group_id
+                )
+                logger.info(f"✨ Auto-created GroupSettings for group {group_id} from user {user_id} defaults")
+                logger.info(f"📋 Settings: AI={group_settings.ai_assistant_enabled}, Silent={group_settings.silent_mode}, KB={group_settings.kb_indexation_enabled}, Moderation={group_settings.moderation_enabled}")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not auto-create group settings for {group_id}: {e}")
+
     logger.info(f"✨ Auto-created GroupLink for user {user_id} in group {group_id} ({group_title})")
 
 
@@ -367,7 +417,7 @@ async def handle_group_message(message: Message) -> None:
         if not user_id:
             logger.warning(f"⚠️ Group message skipped (no user_id): group_id={group_id}")
             return  # Skip messages without user
-        
+
         # ========================================================================
         # AUTO-LINK: Ensure user has GroupLink for this group
         # ========================================================================
@@ -558,8 +608,13 @@ async def handle_group_message(message: Message) -> None:
         # Analyze content for potential KB inclusion before other processing
         # ========================================================================
 
-        # Only process KB gathering if KB indexation is enabled
-        if group_settings and group_settings.kb_indexation_enabled and message_text:
+        # Only process manual KB gathering if enabled per-group
+        # manual_kb_gathering_enabled controls manual KB prompts ("Add to KB?" buttons)
+        # This is separate from automatic Elasticsearch indexing which always works
+        if (group_settings and 
+            group_settings.kb_indexation_enabled and  # Per-group indexation (must be on for KB features)
+            group_settings.manual_kb_gathering_enabled and  # Per-group manual KB prompts toggle
+            message_text):
             try:
                 from luka_bot.handlers.kb_gathering import process_kb_gathering
                 from luka_bot.services.thread_service import get_thread_service
@@ -707,7 +762,8 @@ Be conversational, brief, and friendly. No bullet points or technical details.{l
                             thread_knowledge_bases=[kb_index]
                         )
                         
-                        agent = await create_static_agent_with_basic_tools(user_id)
+                        # Use default enabled tools for group messages
+                        agent = await create_static_agent_with_basic_tools(user_id, enabled_tools=None)
                         result = await agent.run(llm_prompt, deps=ctx)
                         
                         # Extract text from AgentRunResult properly
@@ -859,7 +915,8 @@ Keep it brief and professional."""
                                 thread_knowledge_bases=[kb_index]
                             )
                             
-                            agent = await create_static_agent_with_basic_tools(user_id)
+                            # Use default enabled tools for group messages
+                            agent = await create_static_agent_with_basic_tools(user_id, enabled_tools=None)
                             result = await agent.run(llm_prompt, deps=ctx)
                             
                             # Extract text from AgentRunResult properly
@@ -985,6 +1042,8 @@ Keep it brief and professional."""
         # Update the group_settings variable for use below
         if current_group_settings:
             group_settings = current_group_settings
+        else:
+            logger.warning(f"⚠️ group_settings is None after loading for group {group_id}")
         
         # ========================================================================
         # MESSAGE INDEXING (respects group settings)
@@ -1092,7 +1151,7 @@ Keep it brief and professional."""
                             if settings.CAMUNDA_ENABLED and settings.CAMUNDA_MESSAGE_CORRELATION_ENABLED:
                                 camunda_task = asyncio.create_task(
                                     camunda_service.correlate_message(
-                                        telegram_user_id=user_id,
+                                        user_id=str(user_id),
                                         message_data=enhanced_message_data,
                                         message_type="GROUP_MESSAGE",
                                         kb_doc_id=kb_doc_id
@@ -1136,8 +1195,16 @@ Keep it brief and professional."""
         # AI ASSISTANT LOGIC (only responds to mentions/replies)
         # ========================================================================
         
+        # DEBUG: Log before AI decision
+        logger.debug(f"🔍 About to check AI decision for group {group_id}")
+        logger.debug(f"  - group_settings exists: {group_settings is not None}")
+        if group_settings:
+            logger.debug(f"  - AI enabled: {group_settings.ai_assistant_enabled}")
+            logger.debug(f"  - Respond to all: {group_settings.respond_to_all_messages}")
+        
         # Settings should already be loaded above, but reload to be safe
         if not group_settings:
+            logger.warning(f"⚠️ Reloading group_settings for {group_id} (was None)")
             group_settings = await moderation_service.get_group_settings(group_id)
         
         # FAIL-SAFE: If settings unavailable, default to AI DISABLED (conservative)
@@ -1145,43 +1212,53 @@ Keep it brief and professional."""
             logger.warning(f"⚠️ No group settings for {group_id} - defaulting to AI disabled (fail-safe)")
             return
         
+        ai_enabled = group_settings.ai_assistant_enabled
+        respond_to_all = group_settings.respond_to_all_messages
+        should_respond = False
+        
+        if ai_enabled:
+            if respond_to_all:
+                # Respond to all messages when AI is enabled and respond_to_all_messages is True
+                should_respond = True
+            else:
+                # Only respond to mentions and replies
+                should_respond = is_mentioned or is_reply_to_bot
+        
         logger.info(f"🔍 Group {group_id} AI decision:")
         logger.info(f"  - Settings loaded: {group_settings is not None}")
-        logger.info(f"  - AI enabled: {group_settings.ai_assistant_enabled if group_settings else 'N/A'}")
-        logger.info(f"  - Silent mode: {group_settings.silent_mode if group_settings else 'N/A'}")
-        logger.info(f"  - Should respond: {(is_mentioned or is_reply_to_bot) and group_settings.ai_assistant_enabled if group_settings else False}")
+        logger.info(f"  - AI enabled: {ai_enabled}")
+        logger.info(f"  - Respond to all: {respond_to_all}")
+        logger.info(f"  - Is mentioned: {is_mentioned}")
+        logger.info(f"  - Is reply to bot: {is_reply_to_bot}")
+        logger.info(f"  - Should respond: {should_respond}")
         
-        # NEW BEHAVIOR:
-        # - AI Enabled: Only respond to mentions and replies
-        # - AI Disabled: Respond to nothing (completely disabled)
+        # BEHAVIOR:
+        # - If AI is disabled → ignore all messages
+        # - If respond_to_all_messages is True → respond to all messages
+        # - If respond_to_all_messages is False → only respond to mentions/replies
         
-        if not group_settings.ai_assistant_enabled:
+        if not ai_enabled:
             # AI is disabled - completely ignore all messages
             logger.info(f"🔇 AI assistant disabled for group {group_id}, ignoring message")
             return
         
-        # AI is enabled - ONLY respond to mentions and replies
-        if not (is_mentioned or is_reply_to_bot):
-            logger.debug(f"📭 No mention/reply detected in group {group_id}, skipping AI response")
+        # Check if we should respond based on respond_to_all_messages setting
+        if not respond_to_all and not (is_mentioned or is_reply_to_bot):
+            logger.debug(f"📭 Respond to all disabled and no mention/reply detected in group {group_id}, skipping AI response")
             return
         
         # Bot should respond - log the interaction type
-        interaction_type = "reply" if is_reply_to_bot else "mention"
+        if respond_to_all:
+            interaction_type = "broadcast" if not (is_mentioned or is_reply_to_bot) else ("reply" if is_reply_to_bot else "mention")
+        else:
+            interaction_type = "reply" if is_reply_to_bot else "mention"
         logger.info(f"🔔 Bot {interaction_type} in group {group_id} by user {user_id}")
         
         try:
             from aiogram.enums import ChatAction
-            from luka_bot.services.llm_service import get_llm_service
+            from luka_bot.lg_lukabot.integration import stream_langgraph_agent
+            from luka_bot.lg_lukabot.tools import map_config_tools_to_langgraph_tools
             from luka_bot.utils.formatting import escape_html
-            
-            # Show typing indicator
-            try:
-                await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-            except Exception as e:
-                logger.debug(f"Skipped typing action: {e}")
-            
-            # Get LLM service
-            llm_service = get_llm_service()
             
             # Get group thread
             from luka_bot.services.thread_service import get_thread_service
@@ -1196,75 +1273,92 @@ Keep it brief and professional."""
             # Get group language from thread
             group_language = group_thread.language
             
-            # Build context for LLM
+            # Build context for message
             sender_name = message.from_user.full_name or message.from_user.username or f"User {user_id}"
             
-            # If this is a reply to bot, include the original bot message for context
+            # Prepare user message with group context
             if is_reply_to_bot and bot_original_message:
-                context_parts = [
-                    f"[GROUP REPLY from {sender_name}]"
-                ]
-                if thread_id:
-                    context_parts.append(f"[In topic/thread ID: {thread_id}]")
-                # Include the original bot message that user is replying to
+                # Format as reply with context
                 truncated_original = bot_original_message[:200] + '...' if len(bot_original_message) > 200 else bot_original_message
-                context_parts.append(f"[User is replying to your previous message: \"{truncated_original}\"]")
-                context_parts.append(f"User's reply: {message_text}")
+                user_message = f"[GROUP REPLY from {sender_name}] User is replying to your message: \"{truncated_original}\"\nUser's reply: {message_text}"
             else:
-                context_parts = [f"[GROUP MESSAGE from {sender_name}]"]
-                if thread_id:
-                    context_parts.append(f"[In topic/thread ID: {thread_id}]")
-                context_parts.append(message_text)
+                # Format as regular group message
+                user_message = f"[GROUP MESSAGE from {sender_name}] {message_text}"
             
-            # 🆕 ADD GROUP KB CONTEXT TO INFORM LLM
+            # Add topic context if in a forum topic
+            if thread_id:
+                user_message = f"[In forum topic ID: {thread_id}] {user_message}"
+            
+            # Get KB info for context (LangGraph will have access to search_knowledge_base tool)
+            kb_hint = ""
             if group_thread and group_thread.knowledge_bases:
                 kb_index = group_thread.knowledge_bases[0]
-                
-                # Try to get message count from Elasticsearch
                 try:
                     es_service = await get_elasticsearch_service()
-                    # Get index stats using count API
-                    try:
-                        index_stats = await es_service.es.count(index=kb_index)
-                        message_count = index_stats.get('count', 0)
-                    except:
-                        message_count = 0
-                    
+                    index_stats = await es_service.client.count(index=kb_index)
+                    message_count = index_stats.get('count', 0)
                     if message_count > 0:
-                        context_parts.insert(0, 
-                            f"[GROUP KB: This group has {message_count} searchable messages. "
-                            f"Use search_knowledge_base tool if this question relates to previous group discussions.]"
-                        )
-                    else:
-                        context_parts.insert(0,
-                            "[GROUP KB: Use search_knowledge_base tool to search group message history if relevant.]"
-                        )
+                        kb_hint = f"\n[GROUP KB: {message_count} searchable messages available via search_knowledge_base tool]"
                 except Exception as e:
                     logger.debug(f"Could not get KB stats: {e}")
-                    # Fallback: just mention KB is available
-                    context_parts.insert(0,
-                        "[GROUP KB: Use search_knowledge_base tool to search previous group messages if relevant.]"
-                    )
             
-            llm_input = "\n".join(context_parts)
+            if kb_hint:
+                user_message = kb_hint + "\n" + user_message
             
-            # Add language instruction if needed
-            if group_language == "ru":
-                llm_input += "\n\n[Respond in Russian (русский язык)]"
+            # Show continuous typing status (LangGraph doesn't use thinking emoji in groups)
+            typing_task = None
+            try:
+                async def keep_typing():
+                    while True:
+                        try:
+                            await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+                            await asyncio.sleep(4)  # Typing indicator lasts ~5 seconds
+                        except asyncio.CancelledError:
+                            break
+                        except Exception:
+                            break
+                
+                typing_task = asyncio.create_task(keep_typing())
+            except Exception as e:
+                logger.debug(f"Could not start typing indicator: {e}")
             
-            # Stream response using group thread
+            # Stream response using LangGraph
             full_response = ""
             bot_message = None
+            response_exceeds_limit = False
             
-            async for chunk in llm_service.stream_response(
-                llm_input, 
-                user_id=user_id, 
+            # Map config-style tools to individual LangGraph tool names
+            config_tools = group_thread.enabled_tools or settings.DEFAULT_ENABLED_TOOLS
+            enabled_tools = map_config_tools_to_langgraph_tools(config_tools)
+            logger.debug(f"🔧 Mapped group config tools {config_tools} → LangGraph tools: {enabled_tools}")
+            
+            # Get custom bot personality from group settings (if any)
+            group_bot_prompt = None
+            if group_settings and group_settings.group_bot_prompt:
+                group_bot_prompt = group_settings.group_bot_prompt
+                logger.debug(f"🎭 Using custom bot personality for group {group_id}")
+            
+            async for event in stream_langgraph_agent(
+                message_text=user_message,
+                user_id=user_id,
                 thread_id=group_thread.thread_id,
-                thread=group_thread  # Pass group thread for configuration
+                language=group_language,
+                enabled_tools=enabled_tools,
+                platform="telegram_group",  # Groups don't support reply keyboards
+                group_bot_prompt=group_bot_prompt,
             ):
+                # Extract event type and content
+                event_type = event.get("type") if isinstance(event, dict) else "content"
+                
                 # Handle tool notifications
-                if isinstance(chunk, dict) and chunk.get("type") == "tool_notification":
-                    tool_emoji = chunk.get("text", "🔧")
+                if event_type == "tool_call":
+                    tool_name = event.get("tool_name", "tool")
+                    tool_emoji = "🔧"
+                    if tool_name == "search_knowledge_base":
+                        tool_emoji = "🔍"
+                    elif tool_name == "plan_trip":
+                        tool_emoji = "🗺️"
+                    
                     if bot_message:
                         try:
                             await message.bot.edit_message_text(
@@ -1281,15 +1375,30 @@ Keep it brief and professional."""
                         bot_message = await message.reply(tool_emoji)
                     continue
                 
-                # Handle text chunks - ACCUMULATE, don't replace!
-                if isinstance(chunk, str):
+                # Handle content chunks - ACCUMULATE, don't replace!
+                if event_type == "content":
+                    chunk = event.get("content", "") if isinstance(event, dict) else str(event)
                     full_response += chunk
+                    try:
+                        escaped_full_response = escape_html(full_response)
+                    except Exception as escape_error:
+                        logger.error(f"❌ Error escaping HTML during streaming: {escape_error}", exc_info=True)
+                        # Fallback: basic HTML escaping
+                        escaped_full_response = str(full_response).replace('<', '&lt;').replace('>', '&gt;').replace('&', '&amp;')
                     
-                    # Update message periodically (every ~500 chars or at end)
-                    if bot_message and len(full_response) % 500 < 50:
+                    # Mark when response grows beyond Telegram limit to avoid premature edits
+                    if len(escaped_full_response) > TELEGRAM_LIMIT:
+                        response_exceeds_limit = True
+                    
+                    # Update message periodically (every ~500 chars or at end) if still within limit
+                    if (
+                        bot_message
+                        and not response_exceeds_limit
+                        and len(full_response) % 500 < 50
+                    ):
                         try:
                             await message.bot.edit_message_text(
-                                text=escape_html(full_response),
+                                text=escaped_full_response,
                                 chat_id=message.chat.id,
                                 message_id=bot_message.message_id,
                                 parse_mode="HTML"
@@ -1298,11 +1407,27 @@ Keep it brief and professional."""
                             if "message is not modified" not in str(e).lower():
                                 logger.debug(f"Failed to update message: {e}")
                     elif not bot_message and len(chunk) > 100:
+                        try:
+                            escaped_chunk = escape_html(chunk)
+                        except Exception as escape_error:
+                            logger.error(f"❌ Error escaping HTML chunk: {escape_error}", exc_info=True)
+                            # Fallback: basic HTML escaping
+                            escaped_chunk = str(chunk).replace('<', '&lt;').replace('>', '&gt;').replace('&', '&amp;')
+                        if len(escaped_chunk) > TELEGRAM_LIMIT:
+                            response_exceeds_limit = True
+                            logger.info(
+                                "⏳ GROUP_MESSAGES deferring initial send until final chunking "
+                                f"(chunk length {len(escaped_chunk)} > {TELEGRAM_LIMIT})"
+                            )
+                            continue
+                        
                         # Send initial message once we have enough content
                         # message.reply() automatically preserves message_thread_id
-                        logger.info(f"📤 GROUP_MESSAGES sending initial response to chat_id={message.chat.id}, length={len(chunk)}")
+                        logger.info(
+                            f"📤 GROUP_MESSAGES sending initial response to chat_id={message.chat.id}, length={len(escaped_chunk)}"
+                        )
                         bot_message = await message.reply(
-                            escape_html(chunk),
+                            escaped_chunk,
                             parse_mode="HTML"
                         )
             
@@ -1315,26 +1440,47 @@ Keep it brief and professional."""
                     formatted_response = full_response
                 else:
                     # Regular response - escape HTML for safety
-                    formatted_response = escape_html(full_response)
+                    try:
+                        formatted_response = escape_html(full_response)
+                    except Exception as escape_error:
+                        logger.error(f"❌ Error escaping HTML in final response: {escape_error}", exc_info=True)
+                        # Fallback: basic HTML escaping
+                        formatted_response = str(full_response).replace('<', '&lt;').replace('>', '&gt;').replace('&', '&amp;')
                 
                 if bot_message:
-                    try:
-                        await message.bot.edit_message_text(
-                            text=formatted_response,
-                            chat_id=message.chat.id,
-                            message_id=bot_message.message_id,
-                            parse_mode="HTML"
-                        )
-                    except Exception as e:
-                        if "message is not modified" not in str(e).lower():
-                            logger.warning(f"⚠️  Failed final update: {e}")
+                    if len(formatted_response) > TELEGRAM_LIMIT:
+                        await edit_and_send_parts(bot_message, formatted_response)
+                    else:
+                        try:
+                            await message.bot.edit_message_text(
+                                text=formatted_response,
+                                chat_id=message.chat.id,
+                                message_id=bot_message.message_id,
+                                parse_mode="HTML"
+                            )
+                        except Exception as e:
+                            if "message is not modified" not in str(e).lower():
+                                logger.warning(f"⚠️  Failed final update: {e}")
                 else:
                     # message.reply() automatically preserves message_thread_id
-                    logger.info(f"📤 GROUP_MESSAGES sending final response to chat_id={message.chat.id}, length={len(formatted_response)}")
-                    bot_message = await message.reply(
-                        formatted_response,
-                        parse_mode="HTML"
-                    )
+                    if len(formatted_response) > TELEGRAM_LIMIT:
+                        logger.info(
+                            f"📤 GROUP_MESSAGES sending final response in chunks to chat_id={message.chat.id}, length={len(formatted_response)}"
+                        )
+                        sent_messages = await send_long_message(
+                            chat_id=message.chat.id,
+                            html_text=formatted_response
+                        )
+                        if sent_messages:
+                            bot_message = sent_messages[0]
+                    else:
+                        logger.info(
+                            f"📤 GROUP_MESSAGES sending final response to chat_id={message.chat.id}, length={len(formatted_response)}"
+                        )
+                        bot_message = await message.reply(
+                            formatted_response,
+                            parse_mode="HTML"
+                        )
                 
                 logger.info(f"✅ Sent LLM response to group {group_id}: {len(full_response)} chars")
                 
@@ -1378,11 +1524,34 @@ Keep it brief and professional."""
                     )
                 
         except Exception as e:
-            logger.error(f"❌ Error generating LLM response for group mention: {e}", exc_info=True)
+            import traceback
+            error_type = type(e).__name__
+            error_msg = str(e)
+            full_traceback = traceback.format_exc()
+            
+            # Log comprehensive error details for debugging
+            logger.error(f"❌ Error generating LLM response for group mention:")
+            logger.error(f"   Error type: {error_type}")
+            logger.error(f"   Error message: {error_msg}")
+            logger.error(f"   Group ID: {group_id}")
+            logger.error(f"   User ID: {user_id}")
+            logger.error(f"   Message text (first 200 chars): {message_text[:200] if message_text else '(empty)'}")
+            if group_settings and group_settings.group_bot_prompt:
+                logger.error(f"   Group bot prompt (first 200 chars): {group_settings.group_bot_prompt[:200]}")
+            logger.error(f"   Full traceback:\n{full_traceback}")
+            
             # message.reply() automatically preserves message_thread_id
             await message.reply(
                 "❌ Sorry, I encountered an error while processing your message. Please try again."
             )
+        finally:
+            # Stop typing indicator
+            if typing_task:
+                typing_task.cancel()
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
         
     except Exception as e:
         logger.error(f"❌ Error handling group message: {e}")

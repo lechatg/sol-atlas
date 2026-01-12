@@ -163,6 +163,11 @@ async def handle_profile(message: Message, state: FSMContext) -> None:
         # Send profile with persistent groups keyboard
         await message.answer(profile_text, reply_markup=reply_keyboard, parse_mode="HTML")
         
+        # Send groups actions inline keyboard
+        from luka_bot.keyboards.groups_actions_inline import build_groups_actions_inline_keyboard
+        actions_inline = await build_groups_actions_inline_keyboard(language=lang)
+        await message.answer("🔧 Group Actions", reply_markup=actions_inline)
+
         # Send inline menu as separate message
         await message.answer(
             _('profile.actions_prompt', lang),

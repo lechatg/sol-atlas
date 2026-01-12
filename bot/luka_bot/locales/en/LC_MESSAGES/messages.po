@@ -36,6 +36,9 @@ msgstr "<b>Quick Actions:</b>"
 msgid "actions.intro"
 msgstr "I'm <b>{bot_name}</b>, your AI-powered group management assistant.\n\n🎯 <b>Quick Actions:</b>\n• Manage your groups with /groups\n• Configure your settings with /profile\n• View group statistics and analytics"
 
+msgid "actions.invitation_header"
+msgstr "🔗 <b>Join our community:</b>"
+
 msgid "actions.welcome"
 msgstr "👋 <b>Welcome back, {first_name}!</b>"
 
@@ -1290,7 +1293,10 @@ msgid "group.btn.moderation_submenu"
 msgstr "🛡️ Moderation"
 
 msgid "group.btn.bot_instructions"
-msgstr "📝 Bot Instructions"
+msgstr "📝 Moderation Rules"
+
+msgid "group.btn.bot_personality"
+msgstr "🎭 Bot Personality"
 
 msgid "group.btn.assistant_on"
 msgstr "ON"
@@ -1330,7 +1336,7 @@ msgid "group.ai_assistant_menu.title"
 msgstr "AI Assistant Settings"
 
 msgid "group.ai_assistant_menu.description"
-msgstr "Control AI assistant behavior and knowledge base indexation.\n\n<b>Assistant:</b> Enable/disable bot responses to @mentions\n<b>Knowledge Base:</b> Index messages for searchability\n<b>Bot Instructions:</b> Customize bot behavior with custom prompts"
+msgstr "Control AI assistant behavior and knowledge base indexation.\n\n<b>Assistant:</b> Enable/disable bot responses to @mentions\n<b>Knowledge Base:</b> Index messages for searchability\n<b>Manual Adding to KB:</b> Prompt users to manually add valuable content\n<b>Bot Instructions:</b> Customize bot behavior with custom prompts"
 
 msgid "group.moderation_menu.title"
 msgstr "Moderation Settings"
@@ -1500,11 +1506,20 @@ msgstr "AI Assistant"
 msgid "group_settings.ai_assistant_desc"
 msgstr "Respond to @mentions"
 
+msgid "group_settings.respond_to_all"
+msgstr "💬 Respond to All"
+
+msgid "group_settings.respond_to_all_desc"
+msgstr "Respond to all messages (not just mentions/replies)"
+
 msgid "group_settings.ai_disabled_notice"
 msgstr "AI Assistant is disabled for this group. Contact an admin to enable it."
 
 msgid "group_settings.kb_indexation"
 msgstr "📚 KB Indexation"
+
+msgid "group_settings.manual_kb_gathering"
+msgstr "➕ Manual Adding to KB"
 
 msgid "group_settings.moderate_admins"
 msgstr "🛡️ Moderate Admins"
@@ -1808,6 +1823,40 @@ msgid "user_group_defaults.reset_to_default"
 msgstr "Reset to Default"
 
 # ============================================================================
+# Bot Personality (group_bot_prompt)
+# ============================================================================
+
+msgid "user_group_defaults.bot_personality_title"
+msgstr "🎭 Bot Personality"
+
+msgid "user_group_defaults.bot_personality_desc"
+msgstr "Customize how the bot responds in this group. Add style preferences like 'be playful', 'use emojis', or 'greet users by name'. These are suggestions - harmful instructions will be ignored."
+
+msgid "user_group_defaults.current_personality"
+msgstr "Current Personality"
+
+msgid "user_group_defaults.using_default_personality"
+msgstr "Using default bot personality"
+
+msgid "user_group_defaults.personality_examples"
+msgstr "Examples:\n• Be friendly and use emojis 😄\n• Always greet users by name\n• Keep responses brief and professional\n• Add humor when appropriate"
+
+msgid "user_group_defaults.edit_personality_title"
+msgstr "🎭 <b>Edit Bot Personality</b>"
+
+msgid "user_group_defaults.edit_personality_send_new"
+msgstr "Send me the new personality/style instructions."
+
+msgid "user_group_defaults.edit_personality_current"
+msgstr "<b>Current personality:</b>"
+
+msgid "user_group_defaults.edit_personality_using_default"
+msgstr "<i>Currently using default personality.</i>"
+
+msgid "user_group_defaults.edit_personality_cancel"
+msgstr "Send /cancel to abort."
+
+# ============================================================================
 # Content Type Labels
 # ============================================================================
 
@@ -2060,3 +2109,62 @@ msgstr "❌ Submission cancelled."
 
 msgid "kb_gathering.analyzing_content"
 msgstr "🔍 Analyzing content..."
+
+# Trip Planner strings
+msgid "trip_planner.no_locations_found"
+msgstr "❌ No locations found for '{query}'. Try a different search term."
+
+msgid "trip_planner.location_not_found"
+msgstr "❌ Location '{name}' not found. Please check the spelling or try a different location name."
+
+msgid "trip_planner.no_nearby_locations"
+msgstr "❌ No locations found within {radius} km. Try increasing the search radius."
+
+msgid "trip_planner.no_stops_found"
+msgstr "❌ No stops found along this route. Try a different route or destination."
+
+msgid "trip_planner.no_daytrips_found"
+msgstr "❌ No day trips found from '{origin}'. Try a different starting location."
+
+msgid "trip_planner.no_locations_resolved"
+msgstr "❌ Could not find any of the specified locations. Please check the location names and try again."
+
+msgid "trip_planner.error"
+msgstr "❌ An error occurred while planning your trip: {error}. Please try again."
+
+# Token Inventory Tools
+msgid "tokens.no_results"
+msgstr "❌ No tokens found matching your query."
+
+msgid "tokens.api_error"
+msgstr "❌ API error: Unable to fetch token data. Please try again later."
+
+msgid "tokens.error"
+msgstr "❌ An error occurred while searching tokens: {error}"
+
+msgid "tokens.not_found"
+msgstr "❌ Token not found: {identifier}"
+
+msgid "tokens.search_header"
+msgstr "🔍 **Search Results**"
+
+msgid "tokens.top_volume_header"
+msgstr "🏆 **Top Volume Tokens**"
+
+msgid "tokens.gainers_header"
+msgstr "📈 **Top Gainers**"
+
+msgid "tokens.losers_header"
+msgstr "📉 **Top Losers**"
+
+msgid "tokens.new_listed_header"
+msgstr "🆕 **Newly Listed Tokens**"
+
+msgid "tokens.trending_header"
+msgstr "🔥 **Trending Tokens**"
+
+msgid "tokens.market_overview_header"
+msgstr "📈 **Market Overview**"
+
+msgid "tokens.token_details_header"
+msgstr "📊 **Token Details**"

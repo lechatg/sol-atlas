@@ -1191,6 +1191,9 @@ msgstr "Выберите действие:"
 msgid "actions.intro"
 msgstr "Я <b>{bot_name}</b>, ваш AI-ассистент для управления группами.\n\n🎯 <b>Быстрые действия:</b>\n• Управляйте группами через /groups\n• Настройте параметры через /profile\n• Смотрите статистику и аналитику групп"
 
+msgid "actions.invitation_header"
+msgstr "🔗 <b>Присоединяйтесь к нашему сообществу:</b>"
+
 msgid "actions.welcome"
 msgstr "👋 <b>С возвращением, {first_name}!</b>"
 
@@ -2796,7 +2799,10 @@ msgid "group.btn.moderation_submenu"
 msgstr "🛡️ Модерация"
 
 msgid "group.btn.bot_instructions"
-msgstr "📝 Инструкции бота"
+msgstr "📝 Правила модерации"
+
+msgid "group.btn.bot_personality"
+msgstr "🎭 Личность бота"
 
 msgid "group.btn.assistant_on"
 msgstr "ВКЛ"
@@ -2836,7 +2842,7 @@ msgid "group.ai_assistant_menu.title"
 msgstr "Настройки AI Ассистента"
 
 msgid "group.ai_assistant_menu.description"
-msgstr "Управляйте поведением AI ассистента и индексацией базы знаний.\n\n<b>Ассистент:</b> Включить/выключить ответы бота на @упоминания\n<b>База знаний:</b> Индексировать сообщения для поиска\n<b>Инструкции бота:</b> Настроить поведение бота с помощью custom промптов"
+msgstr "Управляйте поведением AI ассистента и индексацией базы знаний.\n\n<b>Ассистент:</b> Включить/выключить ответы бота на @упоминания\n<b>База знаний:</b> Индексировать сообщения для поиска\n<b>Ручное добавление в БЗ:</b> Предлагать пользователям добавлять ценный контент\n<b>Инструкции бота:</b> Настроить поведение бота с помощью custom промптов"
 
 msgid "group.moderation_menu.title"
 msgstr "Настройки модерации"
@@ -3006,11 +3012,20 @@ msgstr "AI Ассистент"
 msgid "group_settings.ai_assistant_desc"
 msgstr "Отвечать на @упоминания"
 
+msgid "group_settings.respond_to_all"
+msgstr "💬 Ответ на все"
+
+msgid "group_settings.respond_to_all_desc"
+msgstr "Отвечать на все сообщения (не только упоминания/ответы)"
+
 msgid "group_settings.ai_disabled_notice"
 msgstr "AI Ассистент отключен для этой группы. Обратитесь к админу для включения."
 
 msgid "group_settings.kb_indexation"
 msgstr "📚 Индексация БЗ"
+
+msgid "group_settings.manual_kb_gathering"
+msgstr "➕ Ручное добавление в БЗ"
 
 msgid "group_settings.moderate_admins"
 msgstr "🛡️ Модерировать админов"
@@ -3314,6 +3329,40 @@ msgid "user_group_defaults.reset_to_default"
 msgstr "Сбросить на стандартный"
 
 # ============================================================================
+# Bot Personality (group_bot_prompt)
+# ============================================================================
+
+msgid "user_group_defaults.bot_personality_title"
+msgstr "🎭 Личность бота"
+
+msgid "user_group_defaults.bot_personality_desc"
+msgstr "Настройте стиль общения бота в этой группе. Добавьте предпочтения, например 'будь дружелюбным', 'используй эмодзи' или 'обращайся к пользователям по имени'. Это рекомендации - вредоносные инструкции будут игнорироваться."
+
+msgid "user_group_defaults.current_personality"
+msgstr "Текущая личность"
+
+msgid "user_group_defaults.using_default_personality"
+msgstr "Используется стандартная личность бота"
+
+msgid "user_group_defaults.personality_examples"
+msgstr "Примеры:\n• Будь дружелюбным и используй эмодзи 😄\n• Всегда приветствуй пользователей по имени\n• Отвечай кратко и профессионально\n• Добавляй юмор, когда уместно"
+
+msgid "user_group_defaults.edit_personality_title"
+msgstr "🎭 <b>Редактирование личности бота</b>"
+
+msgid "user_group_defaults.edit_personality_send_new"
+msgstr "Отправьте мне новые инструкции по стилю/личности."
+
+msgid "user_group_defaults.edit_personality_current"
+msgstr "<b>Текущая личность:</b>"
+
+msgid "user_group_defaults.edit_personality_using_default"
+msgstr "<i>Сейчас используется стандартная личность.</i>"
+
+msgid "user_group_defaults.edit_personality_cancel"
+msgstr "Отправьте /cancel для отмены."
+
+# ============================================================================
 # Content Type Labels
 # ============================================================================
 
@@ -3514,3 +3563,62 @@ msgstr "❌ Отправка отменена."
 
 msgid "kb_gathering.analyzing_content"
 msgstr "🔍 Анализирую контент..."
+
+# Trip Planner strings
+msgid "trip_planner.no_locations_found"
+msgstr "❌ Местоположения по запросу '{query}' не найдены. Попробуйте другой поисковый запрос."
+
+msgid "trip_planner.location_not_found"
+msgstr "❌ Местоположение '{name}' не найдено. Проверьте написание или попробуйте другое название."
+
+msgid "trip_planner.no_nearby_locations"
+msgstr "❌ Местоположения в радиусе {radius} км не найдены. Попробуйте увеличить радиус поиска."
+
+msgid "trip_planner.no_stops_found"
+msgstr "❌ Остановки по этому маршруту не найдены. Попробуйте другой маршрут или пункт назначения."
+
+msgid "trip_planner.no_daytrips_found"
+msgstr "❌ Однодневные поездки из '{origin}' не найдены. Попробуйте другое место отправления."
+
+msgid "trip_planner.no_locations_resolved"
+msgstr "❌ Не удалось найти ни одно из указанных местоположений. Проверьте названия мест и попробуйте снова."
+
+msgid "trip_planner.error"
+msgstr "❌ Произошла ошибка при планировании поездки: {error}. Пожалуйста, попробуйте снова."
+
+# Token Inventory Tools
+msgid "tokens.no_results"
+msgstr "❌ Токены по вашему запросу не найдены."
+
+msgid "tokens.api_error"
+msgstr "❌ Ошибка API: Не удалось получить данные о токенах. Пожалуйста, попробуйте позже."
+
+msgid "tokens.error"
+msgstr "❌ Произошла ошибка при поиске токенов: {error}"
+
+msgid "tokens.not_found"
+msgstr "❌ Токен не найден: {identifier}"
+
+msgid "tokens.search_header"
+msgstr "🔍 **Результаты поиска**"
+
+msgid "tokens.top_volume_header"
+msgstr "🏆 **Топ токенов по объёму**"
+
+msgid "tokens.gainers_header"
+msgstr "📈 **Лидеры роста**"
+
+msgid "tokens.losers_header"
+msgstr "📉 **Лидеры падения**"
+
+msgid "tokens.new_listed_header"
+msgstr "🆕 **Недавно добавленные токены**"
+
+msgid "tokens.trending_header"
+msgstr "🔥 **Трендовые токены**"
+
+msgid "tokens.market_overview_header"
+msgstr "📈 **Обзор рынка**"
+
+msgid "tokens.token_details_header"
+msgstr "📊 **Детали токена**"

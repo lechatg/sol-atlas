@@ -3,7 +3,7 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.models.openai import OpenAIModel
 from aiogram.utils.i18n import gettext as _
 from loguru import logger
-from typing import List, Any
+from typing import List, Any, Optional
 from datetime import datetime, timezone
 
 from .context import ConversationContext
@@ -56,9 +56,7 @@ You're a conversational AI that helps users with a wide range of tasks - from an
 Your core capabilities include:
 - Having natural, helpful conversations on any topic
 - Searching through users' personal and group knowledge bases to find relevant information
-- Analyzing YouTube videos by extracting and discussing their transcripts
 - Helping organize thoughts and information across multiple conversation threads
-- Assisting with task management and productivity
 - Providing information, explanations, and creative help
 
 **When to use tools:**
@@ -72,16 +70,8 @@ The bot has the following commands that users can access:
 
 **Core Commands:**
 - `/start` - Main entry point showing Quick Actions menu with:
-  • Chats (count) - Access conversation threads
-  • Tasks (count) - View GTD-organized tasks
-  • Profile - User settings and preferences
-
-- `/chat` - Conversation thread management
-  • View all existing conversation threads
-  • Create new threads with custom names
-  • Switch between different conversation contexts
-  • Each thread maintains separate conversation history
-  • Threads can have custom system prompts and KB connections
+  • Chats - Access conversation threads
+  • Tasks - Tasks user can do
 
 - `/search` - Knowledge Base search functionality
   • Create/access dedicated "chatbot_search" thread
@@ -91,16 +81,7 @@ The bot has the following commands that users can access:
   • Toggle multiple KBs simultaneously
   • Search across selected knowledge bases
 
-- `/tasks` - GTD (Getting Things Done) task management (Coming Soon)
-  • Inbox - New unprocessed tasks
-  • Next - Tasks ready to start
-  • Waiting - Tasks blocked/waiting on others
-  • Scheduled - Future dated tasks
-  • Someday - Future ideas and backlog
-  • Integration with Camunda workflows planned
-  • LLM-powered task control commands
-
-- `/groups` - Group management features (Coming Soon)
+- `/groups` - Group management features 
   • Add bot to Telegram groups
   • Map groups/topics to dedicated threads
   • Set group owners for thread management
@@ -114,44 +95,18 @@ The bot has the following commands that users can access:
   • View running processes (Camunda integration)
   • Access usage statistics and leaderboard
 
-- `/reset` - Clear all user data
-  • Delete all conversation threads
-  • Clear conversation history
-  • Reset session state
-  • Fresh start for the user
-
 **Key Features:**
 1. **Multi-threaded Conversations** - Users can maintain separate conversation contexts with different configurations
 2. **Knowledge Base Integration** - Search across personal and group knowledge bases
-3. **YouTube Integration** - Extract and analyze YouTube video transcripts
 4. **Language Support** - Interface available in English and Russian
-5. **Thread Customization** - Each thread can have custom system prompts and KB connections
-6. **Task Management** - GTD-style organization with Camunda workflow integration (in development)
 7. **Group Integration** - Connect Telegram groups to dedicated conversation threads (in development)
 
 **Your Role as Assistant:**
 - Help users navigate and use these features effectively
 - Guide them to the appropriate commands for their needs
 - Explain feature capabilities when asked
-- Use available tools (search_knowledge_base, get_youtube_transcript, etc.) to fulfill user requests
+- Use available tools to fulfill user requests
 - Be proactive in suggesting relevant features based on user needs
-- Inform users about "Coming Soon" features when they ask about unavailable functionality
-
-## MENU AND NAVIGATION TOOLS
-
-When users ask about menus, commands, or navigation:
-- show_start_menu - Display main start menu with quick actions
-- show_groups_menu - Display groups management menu
-- show_chat_menu - Display chat/threads management menu
-- show_profile_menu - Display profile and settings menu
-- show_group_settings - Show settings for a specific group (requires group_id)
-- list_user_groups - List all groups the user has access to
-
-Use these tools when users:
-- Ask "how do I access..."
-- Want to see available options or settings
-- Ask about commands or menus
-- Want to manage groups or view group settings
 
 Always be helpful, professional, and guide users toward completing their available tasks."""
     
@@ -172,17 +127,35 @@ Only add date filters when user says: "last week", "yesterday", "in March", etc.
     # Add emphatic tool usage instruction if requested
     if emphasize_tools:
         base_prompt += date_context  # Insert date context here
-        base_prompt += "\n\n**🎯 TOOL USAGE PRIORITY:**\n"
-        base_prompt += "When users ask about past conversations, messages, or information, "
-        base_prompt += "you MUST use the available search tools to find actual messages. "
-        base_prompt += "Do NOT rely solely on conversation memory - USE THE TOOLS to provide "
-        base_prompt += "accurate references with clickable links that users can follow.\n\n"
+        base_prompt += "\n\n**🎯 WHEN TO USE TOOLS VS. CONVERSATION MEMORY:**\n\n"
+        base_prompt += "**✅ Use CONVERSATION MEMORY (no tools) when:**\n"
+        base_prompt += "- User asks about the current conversation (e.g., 'what did I just say?', 'which numbers did I ask you to remember?')\n"
+        base_prompt += "- Information is in the recent message history you have loaded\n"
+        base_prompt += "- User asks you to remember or recall something from THIS conversation\n"
+        base_prompt += "- Simple questions about recent exchanges\n"
+        base_prompt += "- Example: 'remember number 49' → Just acknowledge, don't search\n"
+        base_prompt += "- Example: 'which numbers did I ask to remember?' → Answer from loaded history\n\n"
+        base_prompt += "**🔍 Use search_knowledge_base tool when:**\n"
+        base_prompt += "- User asks about GROUP activities, discussions, or updates\n"
+        base_prompt += "- User asks to search, find, or list historical messages\n"
+        base_prompt += "- User specifies time periods beyond recent context (e.g., 'last week', 'this month')\n"
+        base_prompt += "- User asks about specific topics or keywords that may not be in loaded history\n"
+        base_prompt += "- User asks 'what did [other people/groups] say' (not asking about themselves)\n"
+        base_prompt += "- User uses explicit search language: 'find', 'search for', 'show me all'\n"
+        base_prompt += "- Example: 'summarize **group** updates' → Search KB\n"
+        base_prompt += "- Example: 'what are the latest **group activities**?' → Search KB\n"
+        base_prompt += "- Example: 'find messages about X' → Search KB\n\n"
         base_prompt += "**⚠️ CRITICAL TOOL USAGE RULES:**\n"
         base_prompt += "1. ALWAYS write 1-3 sentences of text BEFORE calling any tool (users need context)\n"
         base_prompt += "2. Call each tool EXACTLY ONCE per query - NEVER make duplicate/repeated tool calls\n"
         base_prompt += "3. After the tool returns results, generate a brief summary or transition text\n"
         base_prompt += "4. The tool results will be automatically displayed to the user\n"
-        base_prompt += "5. Focus on providing context and interpretation, not just raw search results\n\n"
+        base_prompt += "5. Focus on providing context and interpretation, not just raw search results\n"
+        base_prompt += "6. **CRITICAL**: If a tool returns 'No messages found' or empty results, you MUST still generate a helpful response:\n"
+        base_prompt += "   - Acknowledge what the user was looking for\n"
+        base_prompt += "   - Explain that the knowledge base doesn't have that information yet\n"
+        base_prompt += "   - Offer alternative suggestions or general information if appropriate\n"
+        base_prompt += "   - NEVER return empty output - always provide a helpful message to the user\n\n"
         base_prompt += "**📚 SPECIAL CASE - 'What's in the knowledge base?' Question:**\n"
         base_prompt += "When users ask 'What's in the knowledge base?' or 'What does the KB contain?':\n"
         base_prompt += "- Do NOT call list_recent_messages tool\n"
@@ -238,10 +211,27 @@ Only add date filters when user says: "last week", "yesterday", "in March", etc.
     
     return full_prompt
 
-async def create_static_agent_with_basic_tools(user_id: int) -> Agent:
-    """Create a fast agent with only static tools (no dynamic task tools)."""
+async def create_static_agent_with_basic_tools(
+    user_id: int,
+    enabled_tools: Optional[List[str]] = None
+) -> Agent:
+    """
+    Create a fast agent with only static tools (no dynamic task tools).
+
+    Args:
+        user_id: Telegram user ID
+        enabled_tools: Optional list of enabled tool names. If None or empty, uses DEFAULT_ENABLED_TOOLS.
+                      Tools not in this list will be filtered out before registration.
+    """
     logger.info("Creating static agent with basic tools for immediate response")
     
+    # Determine which tools to enable
+    if enabled_tools is None or len(enabled_tools) == 0:
+        enabled_tools = settings.DEFAULT_ENABLED_TOOLS
+        logger.info(f"🔧 Using default enabled tools: {enabled_tools}")
+    else:
+        logger.info(f"🔧 Using thread-specific enabled tools: {enabled_tools}")
+
     # Create model with automatic provider fallback (Ollama → OpenAI)
     try:
         logger.debug("📦 Step 1a: Importing llm_model_factory...")
@@ -270,10 +260,32 @@ async def create_static_agent_with_basic_tools(user_id: int) -> Agent:
     
     # Build system prompt with user's language preference
     language_instruction = await get_language_instruction_for_user(user_id)
-    
-    # Minimal default agent: Only KB search + support in system prompt
-    # Menu/workflow/twitter modules removed (moved to Bot Assistant sub-agent)
-    tool_modules = [support_tools, youtube_tools, knowledge_base_tools]
+
+
+    # Define all available tool modules with their configuration
+    # Format: (module, module_name, include_in_default)
+    all_tool_modules = [
+        (support_tools, "support", True),
+        (knowledge_base_tools, "knowledge_base", True),
+        (workflow_tools, "workflow", True),
+        (twitter_tools, "twitter", True),  # Re-added: needed for Telegram bot
+        (menu_tools, "menu", False),  # Menu tools optional (can be enabled via enabled_tools)
+        # YouTube tools handled via heuristic path in LLM service
+    ]
+
+    # Filter tool modules for system prompt based on enabled_tools
+    tool_modules = []
+    for module, module_name, include_in_default in all_tool_modules:
+        # Include if: no filtering (use defaults) OR module is explicitly in enabled_tools
+        if not enabled_tools:
+            # No filtering: include default modules
+            if include_in_default:
+                tool_modules.append(module)
+        else:
+            # Filtering active: only include if in enabled_tools
+            if module_name in enabled_tools:
+                tool_modules.append(module)
+
     system_prompt = build_dynamic_system_prompt(
         tool_modules, 
         0, 
@@ -285,17 +297,57 @@ async def create_static_agent_with_basic_tools(user_id: int) -> Agent:
     # Important: YouTube tool is invoked heuristically in LLM service to avoid duplicate agent invocations
     # FIX 32b: Revert to Tool() wrappers - issue was the LLM passing string "conversation"
     
-    # Minimal default agent: KB search + support only
-    # Menu/workflow/twitter tools moved to Bot Assistant sub-agent (coming in Phase 2)
-    static_tools = [
-        *support_tools.get_tools(),          # ✅ Support help
-        *knowledge_base_tools.get_tools(),   # ✅ KB search tool
-        # *youtube_tools.get_tools(),       # ✅ YouTube (handled via heuristic path)
-        # ❌ REMOVED: workflow_tools, menu_tools, twitter_tools (bot control → Bot Assistant sub-agent)
-    ]
+    # Collect and filter tools in one pass
+    all_available_tools = []
+    tool_name_map = {}  # Map tool function name to tool module name
+
+    for module, module_name, include_in_default in all_tool_modules:
+        # Skip menu tools if not explicitly enabled (unless no filtering)
+        if module_name == "menu" and enabled_tools and "menu" not in enabled_tools:
+            continue
+
+        try:
+            # Get tools from module (handle different method names)
+            if module_name == "menu":
+                tools_list = module.get_menu_tools()  # menu_tools uses get_menu_tools()
+            else:
+                tools_list = module.get_tools()  # Standard get_tools()
+
+            logger.debug(f"📦 Module '{module_name}': collected {len(tools_list)} tools")
+
+            # Add tools to collection
+            for tool in tools_list:
+                all_available_tools.append(tool)
+                tool_name_map[tool.name] = module_name
+                logger.debug(f"   - Tool '{tool.name}' mapped to module '{module_name}'")
+        except AttributeError as e:
+            logger.warning(f"Module {module_name} doesn't have get_tools() method: {e}")
+            continue
+        except Exception as e:
+            logger.error(f"❌ Error loading tools from module '{module_name}': {e}", exc_info=True)
+            continue
     
-    # Minimal default agent with KB search + support only
-    logger.info(f"Creating MINIMAL DEFAULT agent with {len(static_tools)} tools (KB search + support only)")
+    # Filter tools based on enabled_tools list
+    if enabled_tools:
+        # Filter: only include tools whose module is in enabled_tools
+        static_tools = []
+        for tool in all_available_tools:
+            tool_module = tool_name_map.get(tool.name)
+            if tool_module in enabled_tools:
+                static_tools.append(tool)
+            else:
+                logger.debug(f"   ⏭️  Tool '{tool.name}' (module: {tool_module}) filtered out (not in {enabled_tools})")
+
+        logger.info(f"Filtered tools: {len(static_tools)}/{len(all_available_tools)} tools enabled (modules: {enabled_tools})")
+        logger.debug(f"   Enabled tool names: {[t.name for t in static_tools]}")
+        logger.debug(f"   Tool module mapping: {dict(tool_name_map)}")
+    else:
+        # No filtering - include all tools (backward compatibility)
+        static_tools = all_available_tools
+        logger.info(f"No tool filtering: {len(static_tools)} tools enabled")
+
+    # Static agent with filtered tools
+    logger.info(f"Creating STATIC agent with {len(static_tools)} tools")
     
     # Create agent WITH tools
     try:
@@ -305,7 +357,7 @@ async def create_static_agent_with_basic_tools(user_id: int) -> Agent:
             system_prompt=system_prompt,
             tools=static_tools,  # Pass Tool objects
             end_strategy='exhaustive',  # Allow both text and tool execution
-            retries=0  # Disable automatic retries to prevent duplicate tool calls
+            retries=1  # Allow one retry for output validation failures (needed for complex workflow instructions)
         )
         logger.info("Agent created successfully with tools")
     except Exception as e:
@@ -354,103 +406,31 @@ async def create_agent_with_user_tasks(ctx: ConversationContext) -> Agent:
             )
         )
         logger.info(f"LLM model configured with fallback: {model.model_name}")
+
+        # Collect static tools using the same configuration as create_static_agent_with_basic_tools
+        # Define tool modules (same as static agent)
+        static_tool_modules = [
+            (support_tools, "support"),
+            (knowledge_base_tools, "knowledge_base"),
+            (workflow_tools, "workflow"),
+            (twitter_tools, "twitter"),
+            (youtube_tools, "youtube"),
+            # Menu tools not included in user tasks agent
+        ]
         
-        # DEBUG logging removed - model now uses automatic fallback system
-        
-        # Collect tools for this agent
-        
-        # Skip old debug code - model now uses automatic fallback system
-        if False:  # Disabled debug code
-            if hasattr(None, 'post'):
-                original_post = client.post
-                async def logged_post(*args, **kwargs):
-                    logger.error("🔧 HTTP DEBUG: =================== POST REQUEST START ===================")
-                    logger.error("🔧 HTTP DEBUG: POST request to model")
-                    logger.error(f"🔧 HTTP DEBUG: args: {args}")
-                    logger.error(f"🔧 HTTP DEBUG: URL: {args[0] if args else 'unknown'}")
-                    logger.error(f"🔧 HTTP DEBUG: All kwargs keys: {list(kwargs.keys())}")
-                    logger.error(f"🔧 HTTP DEBUG: Provider base_url: {getattr(ollama_provider, 'base_url', 'unknown')}")
-                    logger.error("🔧 HTTP DEBUG: =================== POST REQUEST END ===================")
-                    
-                    # Extract JSON data from body parameter (OpenAI uses 'body' not 'json')
-                    json_data = None
-                    if 'body' in kwargs:
-                        body = kwargs['body']
-                        logger.info(f"🔧 HTTP DEBUG: Body type: {type(body)}")
-                        if hasattr(body, 'decode'):
-                            try:
-                                import json as json_lib
-                                json_data = json_lib.loads(body.decode('utf-8'))
-                                logger.info("🔧 HTTP DEBUG: Successfully parsed JSON from body")
-                            except Exception as e:
-                                logger.info(f"🔧 HTTP DEBUG: Failed to parse JSON from body: {e}")
-                        elif isinstance(body, dict):
-                            json_data = body
-                            logger.info("🔧 HTTP DEBUG: Body is already dict")
-                        else:
-                            logger.info(f"🔧 HTTP DEBUG: Body content (first 200 chars): {str(body)[:200]}")
-                    elif 'json' in kwargs:
-                        json_data = kwargs['json']
-                        logger.info("🔧 HTTP DEBUG: Using json parameter")
-                    
-                    if json_data:
-                        logger.info(f"🔧 HTTP DEBUG: Request payload keys: {list(json_data.keys()) if isinstance(json_data, dict) else 'not dict'}")
-                        if isinstance(json_data, dict):
-                            logger.info(f"🔧 HTTP DEBUG: Model: {json_data.get('model', 'not specified')}")
-                            logger.info(f"🔧 HTTP DEBUG: Has tools: {'tools' in json_data}")
-                            logger.info(f"🔧 HTTP DEBUG: Has functions: {'functions' in json_data}")
-                            if 'tools' in json_data:
-                                tools = json_data['tools']
-                                logger.info(f"🔧 HTTP DEBUG: Tools count: {len(tools) if isinstance(tools, list) else 'not list'}")
-                                if isinstance(tools, list) and tools:
-                                    for i, tool in enumerate(tools[:3]):  # Log first 3 tools
-                                        if isinstance(tool, dict) and 'function' in tool:
-                                            func_name = tool['function'].get('name', 'unnamed')
-                                            logger.info(f"🔧 HTTP DEBUG: Tool {i+1}: {func_name}")
-                                        else:
-                                            logger.info(f"🔧 HTTP DEBUG: Tool {i+1}: {tool}")
-                            if 'messages' in json_data:
-                                messages = json_data['messages']
-                                logger.info(f"🔧 HTTP DEBUG: Messages count: {len(messages) if isinstance(messages, list) else 'not list'}")
-                                if isinstance(messages, list):
-                                    for i, msg in enumerate(messages):
-                                        if isinstance(msg, dict):
-                                            role = msg.get('role', 'unknown')
-                                            content = msg.get('content', '')
-                                            logger.info(f"🔧 HTTP DEBUG: Message {i+1}: role={role}, length={len(content)}")
-                                            if role == 'system':
-                                                logger.info(f"🔧 HTTP DEBUG: System message content (first 200 chars): {content[:200]}")
-                                                logger.info(f"🔧 HTTP DEBUG: System message has 'search_knowledge_base': {'search_knowledge_base' in content}")
-                                                logger.info(f"🔧 HTTP DEBUG: System message has 'tool': {'tool' in content.lower()}")
-                    
-                    try:
-                        logger.info("🔧 HTTP DEBUG: Making actual request...")
-                        response = await original_post(*args, **kwargs)
-                        logger.info(f"🔧 HTTP DEBUG: Request successful, response type: {type(response)}")
-                        return response
-                    except Exception as e:
-                        logger.error(f"🔧 HTTP DEBUG: Request failed with error: {e}")
-                        logger.error(f"🔧 HTTP DEBUG: Error type: {type(e)}")
-                        if hasattr(e, 'response'):
-                            logger.error(f"🔧 HTTP DEBUG: Response status: {getattr(e.response, 'status_code', 'unknown')}")
-                            logger.error(f"🔧 HTTP DEBUG: Response text: {getattr(e.response, 'text', 'unknown')}")
-                        raise
-                pass  # Debug code disabled
-        
-        # Note: Debug logging disabled - using automatic fallback system now
-        
-        # TEMPORARILY DISABLE: basic_camunda_tools = camunda_tools.get_tools()
-        # TEMPORARILY DISABLE: support_tools_list = support_tools.get_tools()
-        kb_tools_list = knowledge_base_tools.get_tools()
-        youtube_tools_list = youtube_tools.get_tools()
-        # workflow_tools_list = workflow_tools.get_tools()  # Phase 4+: Not yet implemented
-        workflow_tools_list = []  # Placeholder
-        
-        # Combine all tools
+        # Collect static tools
+        static_tools_list = []
+        for module, module_name in static_tool_modules:
+            try:
+                tools = module.get_tools()
+                static_tools_list.extend(tools)
+            except AttributeError as e:
+                logger.warning(f"Module {module_name} doesn't have get_tools() method: {e}")
+                continue
+
+        # Combine all tools (static + dynamic)
         all_tools = [
-            *kb_tools_list,
-            *youtube_tools_list,
-            *workflow_tools_list,
+            *static_tools_list,
             *dynamic_tools
         ]
         
@@ -485,7 +465,7 @@ Always be helpful and professional.{language_instruction}"""
                 system_prompt=system_prompt,
                 tools=all_tools,  # Pass all tools directly
                 end_strategy='exhaustive',  # Allow both text and tool execution
-                retries=0  # Disable automatic retries to prevent duplicate tool calls
+            retries=1  # Allow one retry for output validation failures
             )
             
             logger.info(f"Agent created successfully with {len(all_tools)} tools")

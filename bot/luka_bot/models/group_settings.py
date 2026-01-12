@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 import json
+from loguru import logger
 
 
 @dataclass
@@ -57,12 +58,28 @@ class GroupSettings:
     # AI Assistant toggle - enable/disable AI responses to @mentions
     ai_assistant_enabled: bool = False  # Changed from True to match factory defaults
     
+    # Respond to all messages - when True, bot responds to all messages (not just mentions/replies)
+    # When False, bot only responds to @mentions and replies to bot messages
+    respond_to_all_messages: bool = False  # Default: only mentions/replies
+    
     # Knowledge Base indexation - enable/disable message indexing for search
     kb_indexation_enabled: bool = True
+    
+    # Manual KB Gathering - enable/disable manual "Add to KB?" prompts
+    # When enabled, bot prompts users to manually add forwarded/linked content to KB
+    # When disabled, only automatic background indexing works (no prompts)
+    # Default: False (feature incomplete, admins can enable per-group if needed)
+    manual_kb_gathering_enabled: bool = False
     
     # Default language for new groups (used in user defaults)
     # When user adds bot to a group, this language is applied to the group
     language: str = "en"  # "en" or "ru"
+    
+    # Bot Personality - custom instructions for how bot responds in this group
+    # This is injected as an ADDITIONAL layer on top of the base system prompt
+    # Admins can customize conversational style (e.g., "be playful", "use emojis")
+    # Safety wrapper ensures harmful instructions are ignored
+    group_bot_prompt: Optional[str] = None  # Max ~1000 chars recommended
     
     # ============================================================================
     # GROUP PROFILE (for /help display)
@@ -190,8 +207,11 @@ class GroupSettings:
             # Note: silent_addition was removed - silent_mode now handles both cases
             "silent_mode": str(self.silent_mode),
             "ai_assistant_enabled": str(self.ai_assistant_enabled),
+            "respond_to_all_messages": str(self.respond_to_all_messages),
             "kb_indexation_enabled": str(self.kb_indexation_enabled),
+            "manual_kb_gathering_enabled": str(self.manual_kb_gathering_enabled),
             "language": self.language,
+            "group_bot_prompt": self.group_bot_prompt or "",
             
             # Group profile
             "custom_description": self.custom_description or "",
@@ -255,8 +275,19 @@ class GroupSettings:
         """Create from dictionary (Redis data)."""
         
         def parse_bool(value: str) -> bool:
-            """Parse boolean from string."""
-            return value.lower() == "true" if isinstance(value, str) else bool(value)
+            """Parse boolean from string - handles multiple formats."""
+            if isinstance(value, str):
+                value_lower = value.lower().strip()
+                # Handle common boolean string representations
+                if value_lower in ("true", "1", "yes", "on", "enabled"):
+                    return True
+                elif value_lower in ("false", "0", "no", "off", "disabled", ""):
+                    return False
+                # If we get here, log a warning and default to False
+                logger.warning(f"⚠️ Unexpected boolean string value: '{value}', defaulting to False")
+                return False
+            # Handle non-string values
+            return bool(value) if value is not None else False
         
         def parse_json_list(value: str) -> list:
             """Parse JSON list from string."""
@@ -280,8 +311,11 @@ class GroupSettings:
             # Note: silent_addition was removed - it's now handled only via silent_mode
             silent_mode=parse_bool(data.get("silent_mode", "False")),
             ai_assistant_enabled=parse_bool(data.get("ai_assistant_enabled", "True")),
+            respond_to_all_messages=parse_bool(data.get("respond_to_all_messages", "False")),
             kb_indexation_enabled=parse_bool(data.get("kb_indexation_enabled", "True")),
+            manual_kb_gathering_enabled=parse_bool(data.get("manual_kb_gathering_enabled", "False")),
             language=data.get("language", "en"),
+            group_bot_prompt=data.get("group_bot_prompt") or None,
             
             # Group profile
             custom_description=data.get("custom_description") or None,

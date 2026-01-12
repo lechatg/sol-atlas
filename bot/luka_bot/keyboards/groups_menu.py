@@ -14,6 +14,31 @@ from luka_bot.utils.i18n_helper import _
 ACTIVE_GROUP_INDICATOR = "💬"
 
 
+def _normalize_button_text(text: str) -> str:
+    """
+    Normalize button text for comparison.
+    
+    Removes variation selectors, trims whitespace, and strips trailing ellipsis/dots
+    Telegram sometimes appends when rendering button labels (for long texts).
+    """
+    if not text:
+        return ""
+    normalized = text.replace("\uFE0F", "").strip()
+    # Strip trailing ellipsis characters (Unicode or three dots)
+    normalized = normalized.rstrip(".… ").rstrip()
+    return normalized
+
+
+DEFAULT_SETTINGS_BUTTON_VARIANTS = {
+    _normalize_button_text("⚙️ Default Settings"),
+    _normalize_button_text("📋 Default Settings"),
+    _normalize_button_text("Default Settings"),
+    _normalize_button_text("⚙️ Настройки по умолчанию"),
+    _normalize_button_text("📋 Настройки по умолчанию"),
+    _normalize_button_text("Настройки по умолчанию"),
+}
+
+
 async def _resolve_group_name(group_id: int) -> str:
     """
     Resolve group name from multiple sources with fallbacks.
@@ -73,12 +98,6 @@ async def get_groups_keyboard(
     """
     buttons = []
     
-    # Row 0 - New Group button only
-    new_group_text = _('groups.keyboard.btn_new_group', language)
-    buttons.append([
-        KeyboardButton(text=new_group_text)
-    ])
-    
     # Show up to max_groups most recent
     display_groups = groups[:max_groups]
     
@@ -120,10 +139,6 @@ async def get_groups_keyboard(
     if current_row:
         buttons.append(current_row)
     
-    # Add "Default Settings" button at the end
-    default_settings_text = _('groups.keyboard.btn_default_settings', language)
-    buttons.append([KeyboardButton(text=default_settings_text)])
-    
     keyboard = ReplyKeyboardMarkup(
         keyboard=buttons,
         resize_keyboard=True,
@@ -139,7 +154,7 @@ async def get_empty_groups_keyboard(language: str = "en") -> ReplyKeyboardMarkup
     """
     Keyboard when user has no groups yet (empty state).
     
-    Shows section header + new group button, and default settings.
+    Shows a minimal keyboard (no buttons, just placeholder).
     
     Args:
         language: User's language preference (en/ru)
@@ -147,17 +162,11 @@ async def get_empty_groups_keyboard(language: str = "en") -> ReplyKeyboardMarkup
     Returns:
         Minimal reply keyboard for empty state
     """
-    new_group_text = _('groups.keyboard.btn_new_group', language)
-    
-    buttons = [
-        # New Group button only
-        [KeyboardButton(text=new_group_text)],
-        # Default Settings button
-        [KeyboardButton(text=_('groups.keyboard.btn_default_settings', language))],
-    ]
+    # Empty keyboard - just placeholder text
+    buttons = []
     
     keyboard = ReplyKeyboardMarkup(
-        keyboard=buttons,
+        keyboard=buttons if buttons else [[KeyboardButton(text=" ")]],  # At least one button required
         resize_keyboard=True,
         one_time_keyboard=False,
         input_field_placeholder=_('groups.keyboard.empty_placeholder', language)
@@ -213,6 +222,13 @@ async def is_group_button(text: str, groups: List[GroupLink]) -> Optional[int]:
     return None
 
 
+def is_default_settings_button(text: str) -> bool:
+    """Return True when text represents the Default Settings button (any supported variant)."""
+    if not text:
+        return False
+    return _normalize_button_text(text) in DEFAULT_SETTINGS_BUTTON_VARIANTS
+
+
 def is_control_button(text: str) -> bool:
     """Check if text is a control button (NOT a group button)."""
     # These buttons are NOT group selection buttons
@@ -222,13 +238,12 @@ def is_control_button(text: str) -> bool:
         "🗑️",
         "➕ New Group",
         "➕ Новая группа",
-        "⚙️ Default Settings",
-        "⚙️ Настройки по умолчанию",
     ]
-    return text in control_buttons
+    if text in control_buttons:
+        return True
+    return is_default_settings_button(text)
 
 
 def remove_keyboard() -> ReplyKeyboardRemove:
     """Remove reply keyboard."""
     return ReplyKeyboardRemove()
-

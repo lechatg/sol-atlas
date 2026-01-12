@@ -39,6 +39,32 @@ services:
     #  - 'redis-server'
     #  - '--requirepass myStrongPassword'
 
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    container_name: elasticsearch
+    restart: always
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"  # Limit memory usage
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - app
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
   # MONITORING
 #  node-exporter:
 #    image: prom/node-exporter:latest
@@ -113,5 +139,6 @@ networks:
 volumes:
   postgres-data: {}
   redis-data: {}
+  elasticsearch-data: {}
   prometheus-data: {}
   grafana-data: {}

@@ -6,6 +6,8 @@ Completely independent from bot_server.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Union
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Directories
@@ -31,7 +33,11 @@ class BotSettings(EnvBaseSettings):
     
     # Internationalization
     DEFAULT_LOCALE: str = "en"  # Default language for bot interface ("en", "ru", etc.)
-    
+    SUPPORTED_LANGUAGES: list[str] = ["en", "ru"]  # List of supported language codes
+
+    # Polling Lock (prevents multiple instances from polling simultaneously)
+    POLLING_LOCK_ENABLED: bool = False  # Enable Redis-based polling lock (default: disabled)
+
     # Bot Privacy Mode (set via @BotFather -> Bot Settings -> Group Privacy)
     # False = DISABLED (bot sees all messages) - Current setting for this bot
     # True = ENABLED (bot only sees mentions/replies/commands)
@@ -106,7 +112,7 @@ class LLMSettings(EnvBaseSettings):
     # Example: http://localhost:11434 (NOT http://localhost:11434/v1)
     # The /v1 suffix is added automatically for OpenAI-compatible API requests
     OLLAMA_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL_NAME: str = "llama3.2"  # Default model for ollama provider
+    OLLAMA_MODEL_NAME: str = "gpt-oss"  # Default model for ollama provider
     OLLAMA_TIMEOUT: int = 15  # Reduced from 60s for faster failover
     
     # OpenAI Provider Settings (Phase 4+)
@@ -117,7 +123,7 @@ class LLMSettings(EnvBaseSettings):
     
     # Default LLM Provider (used when thread.llm_provider is None)
     DEFAULT_LLM_PROVIDER: str = "ollama"  # "ollama" or "openai"
-    DEFAULT_LLM_MODEL: str = "llama3.2"  # Default model name
+    DEFAULT_LLM_MODEL: str = "gpt-oss"  # Default model name
     
     # LLM Generation Parameters
     LLM_TEMPERATURE: float = 0.7
@@ -127,16 +133,16 @@ class LLMSettings(EnvBaseSettings):
     LLM_PRESENCE_PENALTY: float = 0.1
     
     # Streaming Response Settings
-    # Controls how LLM responses are sent to users via Telegram
-    # IMPORTANT: For high-traffic bots, consider disabling streaming to reduce API load
-    STREAMING_ENABLED: bool = False  # Enable/disable streaming (set to False for direct answers only)
+    # Controls how LLM responses are sent to users via Telegram/Web
+    # Streaming provides better UX by showing progressive responses
+    STREAMING_ENABLED: bool = True  # Enable/disable streaming (recommended: True for better UX)
     STREAMING_UPDATE_INTERVAL: float = 2.0  # Minimum seconds between message edits (prevents API flooding)
     STREAMING_MIN_CHUNK_SIZE: int = 50  # Minimum character delta before updating (prevents tiny updates)
     
     # Available LLM Providers and Models Configuration
     # Format: provider -> list of available models
     AVAILABLE_PROVIDERS: dict = {
-        "ollama": ["gpt-oss", "llama3.2"],
+        "ollama": ["gpt-oss", "gpt-oss"],
         "openai": ["gpt-5", "gpt-4-turbo"],
     }
     
@@ -240,12 +246,63 @@ IMPORTANT: The user prefers to communicate in {language}. Please respond in {lan
     # Default Knowledge Base
     LUKA_DEFAULT_KNOWLEDGE_BASE: str = "default_kb"
     
+    # Public Knowledge Base (for guest users and general access)
+    # This index should contain publicly accessible content (docs, guides, FAQs)
+    # When set, guest users will search this index instead of their personal KB
+    # When empty (default), guests use personal KB (backward compatible)
+    # Can be a single index name or comma-separated list of indices
+    # Example: LUKA_PUBLIC_KNOWLEDGE_BASE=luka-public-kb
+    # Example: LUKA_PUBLIC_KNOWLEDGE_BASE=luka-public-kb,another-public-kb
+    LUKA_PUBLIC_KNOWLEDGE_BASE: str = ""
+
+    # LangGraph Settings (Migration from Pydantic-AI)
+    # Enable LangGraph-based agent architecture for unified web/Telegram experience
+    LANGGRAPH_ENABLED: bool = Field(default=True, description="Enable LangGraph agent (replaces pydantic-ai)")
+    LANGGRAPH_CHECKPOINTER: str = Field(default="redis", description="Checkpointer type: redis, postgres, memory")
+    LANGGRAPH_DEBUG: bool = Field(default=False, description="Enable LangGraph debug mode and tracing")
+
+    # Sub-Agent Settings (BMAD-Compatible Agent System)
+    # Sub-agents are specialized AI personalities with their own system prompts, tools, and configurations
+    # Examples: general_luka (default), crypto_analyst, trip_planner
+    DEFAULT_SUB_AGENT_TELEGRAM: str = Field(
+        default="general_luka",
+        description="Default sub-agent for Telegram platform"
+    )
+    DEFAULT_SUB_AGENT_WEB: str = Field(
+        default="general_luka",
+        description="Default sub-agent for web platform (ag_ui_gateway)"
+    )
+
+    @property
+    def public_knowledge_bases(self) -> list[str]:
+        """
+        Get list of public knowledge base indices for guest users.
+
+        Parses LUKA_PUBLIC_KNOWLEDGE_BASE as comma-separated string or single value.
+
+        Returns:
+            List of KB index names, empty list if not configured
+        """
+        if not self.LUKA_PUBLIC_KNOWLEDGE_BASE:
+            return []
+
+        # Split by comma and strip whitespace
+        indices = [
+            index.strip()
+            for index in self.LUKA_PUBLIC_KNOWLEDGE_BASE.split(',')
+            if index.strip()
+        ]
+        return indices
+
     # Tools Configuration (Phase 4)
     # List of tools enabled by default for new threads
-    DEFAULT_ENABLED_TOOLS: list = [
+    # Can be set via environment variable as comma-separated string:
+    # DEFAULT_ENABLED_TOOLS="knowledge_base,tripplanner"
+    # Or as JSON array: DEFAULT_ENABLED_TOOLS='["knowledge_base","tripplanner"]'
+    DEFAULT_ENABLED_TOOLS: Union[str, list[str]] = [
         "knowledge_base",  # KB search via Elasticsearch/Flow API
-        "support",         # Support and help resources
-        "youtube",         # YouTube transcript tool
+        # "support",         # Support and help resources
+        # "youtube",         # YouTube transcript tool
         "workflow",        # Dialog workflows
         # Future: "camunda"
     ]
@@ -257,6 +314,75 @@ IMPORTANT: The user prefers to communicate in {language}. Please respond in {lan
     # Legacy KB Settings (kept for backward compatibility)
     ELASTICSEARCH_INDEX: str = "knowledge_base"
     KNOWLEDGE_BASE_GROUP_ID: str | None = None  # Default KB group for queries
+
+    # Default Groups and Channels
+    # These are automatically provisioned to all users when they first interact with the bot
+    # Set LUKA_DEFAULT_GROUP_ID to enable default group provisioning
+    # Set LUKA_DEFAULT_CHANNEL_ID to enable default channel provisioning
+    LUKA_DEFAULT_GROUP_ID: int | None = None  # Telegram group ID (negative integer)
+    LUKA_DEFAULT_GROUP_TITLE: str = ""  # Display name for the default group
+    LUKA_DEFAULT_GROUP_INVITE_LINK: str = ""  # Invite link for default group (e.g., https://t.me/groupname or t.me/+invitecode)
+    LUKA_DEFAULT_CHANNEL_ID: int | None = None  # Telegram channel ID (negative integer)
+    LUKA_DEFAULT_CHANNEL_TITLE: str = ""  # Display name for the default channel
+    LUKA_DEFAULT_CHANNEL_INVITE_LINK: str = ""  # Invite link for default channel (e.g., https://t.me/channelname or t.me/+invitecode)
+
+    @property
+    def has_default_group(self) -> bool:
+        """Check if default group is configured."""
+        return self.LUKA_DEFAULT_GROUP_ID is not None and self.LUKA_DEFAULT_GROUP_TITLE != ""
+
+    @property
+    def has_default_channel(self) -> bool:
+        """Check if default channel is configured."""
+        return self.LUKA_DEFAULT_CHANNEL_ID is not None and self.LUKA_DEFAULT_CHANNEL_TITLE != ""
+
+    def get_default_group_kb_index(self) -> str | None:
+        """
+        Get KB index name for default group.
+
+        Returns:
+            KB index name in format: tg-kb-group-{group_id} or None if not configured
+        """
+        if not self.has_default_group:
+            return None
+        # Remove leading minus sign and convert to positive string
+        group_id_str = str(abs(self.LUKA_DEFAULT_GROUP_ID))
+        return f"{self.ELASTICSEARCH_GROUP_KB_PREFIX}{group_id_str}"
+
+    def get_default_channel_kb_index(self) -> str | None:
+        """
+        Get KB index name for default channel.
+
+        Returns:
+            KB index name in format: tg-kb-group-{channel_id} or None if not configured
+        """
+        if not self.has_default_channel:
+            return None
+        # Remove leading minus sign and convert to positive string
+        channel_id_str = str(abs(self.LUKA_DEFAULT_CHANNEL_ID))
+        return f"{self.ELASTICSEARCH_GROUP_KB_PREFIX}{channel_id_str}"
+
+    def get_default_group_invite_link(self) -> str | None:
+        """
+        Get invite link for default group.
+
+        Returns:
+            Invite link URL or None if not configured
+        """
+        if not self.has_default_group:
+            return None
+        return self.LUKA_DEFAULT_GROUP_INVITE_LINK if self.LUKA_DEFAULT_GROUP_INVITE_LINK else None
+
+    def get_default_channel_invite_link(self) -> str | None:
+        """
+        Get invite link for default channel.
+
+        Returns:
+            Invite link URL or None if not configured
+        """
+        if not self.has_default_channel:
+            return None
+        return self.LUKA_DEFAULT_CHANNEL_INVITE_LINK if self.LUKA_DEFAULT_CHANNEL_INVITE_LINK else None
 
 
 class FlowAPISettings(EnvBaseSettings):

@@ -17,9 +17,11 @@ Used by:
 DEFAULT_GROUP_SETTINGS = {
     # Bot Behavior
     "silent_mode": True,  # Suppress bot service/system messages (no group messages, no DMs)
-    "ai_assistant_enabled": False,  # Enable AI responses to mentions/replies
+    "ai_assistant_enabled": True,  # Enable AI responses to mentions/replies
+    "respond_to_all_messages": False,  # Only respond to mentions/replies (not all messages)
     "kb_indexation_enabled": True,  # Enable knowledge base indexation
     "language": "en",  # Default language for new groups (will be set from app locale on first creation)
+    "group_bot_prompt": None,  # Custom bot personality (None = use default)
     
     # Moderation
     "moderate_admins_enabled": False,  # Don't moderate admins by default

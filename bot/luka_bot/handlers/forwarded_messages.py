@@ -12,12 +12,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from loguru import logger
 
-from luka_bot.services.llm_service import get_llm_service
 from luka_bot.services.message_state_service import get_message_state_service
 from luka_bot.services.messaging_service import edit_and_send_parts
 from luka_bot.services.thread_service import get_thread_service
 from luka_bot.utils.formatting import escape_html
 from luka_bot.utils.i18n_helper import get_user_language
+
+import asyncio
 
 router = Router()
 
@@ -480,8 +481,7 @@ async def handle_forwarded_message(message: Message, state: FSMContext) -> None:
         logger.debug(f"Skipped typing action: {e}")
 
     try:
-        # Get services
-        llm_service = get_llm_service()
+        # Get services (no longer need llm_service - using LangGraph)
         thread_service = get_thread_service()
         message_state_service = get_message_state_service()
 
@@ -502,21 +502,27 @@ async def handle_forwarded_message(message: Message, state: FSMContext) -> None:
 
         logger.info(f"🤖 Sending forwarded message to LLM with context: {len(llm_input)} chars")
 
-        # Send "thinking" message
-        bot_message = await message.answer("🤔")
+        # Show continuous typing status
+        from aiogram.enums import ChatAction
+        typing_task = None
+        try:
+            async def keep_typing():
+                while True:
+                    try:
+                        await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+                        await asyncio.sleep(4)
+                    except asyncio.CancelledError:
+                        break
+                    except Exception:
+                        break
+            
+            typing_task = asyncio.create_task(keep_typing())
+        except Exception as e:
+            logger.debug(f"Could not start typing indicator: {e}")
 
-        # Track this message for updates
-        await message_state_service.save_message(
-            user_id=user_id,
-            chat_id=message.chat.id,
-            message_id=bot_message.message_id,
-            message_type="thinking",
-            original_text="🤔"
-        )
-
-        # Stream LLM response with configurable streaming
+        # Stream LLM response using LangGraph
         full_response = ""  # Initialize accumulator
-        last_tool_emoji = None
+        bot_message = None
 
         # Throttling variables for streaming mode
         import time
@@ -524,24 +530,61 @@ async def handle_forwarded_message(message: Message, state: FSMContext) -> None:
         last_update_length = 0
         last_sent_text = ""
         edit_count = 0
+        
+        # Use LangGraph streaming
+        from luka_bot.lg_lukabot.integration import stream_langgraph_agent
+        from luka_bot.lg_lukabot.tools import map_config_tools_to_langgraph_tools
+        from luka_bot.core.config import settings
 
-        async for chunk in llm_service.stream_response(llm_input, user_id, thread_id, thread=thread):
-            # Check if chunk is a tool notification dict
-            if isinstance(chunk, dict) and chunk.get("type") == "tool_notification":
-                # Edit message to show tool emoji
-                tool_emoji = chunk.get("text", "🔧")
-                last_tool_emoji = tool_emoji
+        # Map config-style tools to individual LangGraph tool names
+        config_tools = thread.enabled_tools if thread else settings.DEFAULT_ENABLED_TOOLS
+        enabled_tools = map_config_tools_to_langgraph_tools(config_tools)
 
-                try:
-                    await message.bot.edit_message_text(
-                        text=tool_emoji,
+        async for event in stream_langgraph_agent(
+            message_text=llm_input,
+            user_id=user_id,
+            thread_id=thread_id,
+            language=thread.language if thread else "en",
+            enabled_tools=enabled_tools,
+        ):
+            # Extract event type and content
+            event_type = event.get("type") if isinstance(event, dict) else "content"
+            
+            # Handle tool notifications
+            if event_type == "tool_call":
+                tool_name = event.get("tool_name", "tool")
+                tool_emoji = "🔧"
+                if tool_name == "search_knowledge_base":
+                    tool_emoji = "🔍"
+                elif tool_name == "plan_trip":
+                    tool_emoji = "🗺️"
+                
+                # Update status message
+                if not bot_message:
+                    bot_message = await message.answer(tool_emoji)
+                    await message_state_service.save_message(
+                        user_id=user_id,
                         chat_id=message.chat.id,
-                        message_id=bot_message.message_id
+                        message_id=bot_message.message_id,
+                        message_type="tool_status",
+                        original_text=tool_emoji
                     )
-                    logger.info(f"✏️  Edited message to show tool: {chunk.get('tool_name')} ({tool_emoji})")
-                except Exception as e:
-                    if "message is not modified" not in str(e).lower():
-                        logger.debug(f"Failed to edit message: {e}")
+                else:
+                    try:
+                        await message.bot.edit_message_text(
+                            text=tool_emoji,
+                            chat_id=message.chat.id,
+                            message_id=bot_message.message_id
+                        )
+                    except Exception as e:
+                        if "message is not modified" not in str(e).lower():
+                            logger.debug(f"Failed to edit message: {e}")
+                continue
+            
+            # Handle content chunks
+            if event_type == "content":
+                chunk = event.get("content", "") if isinstance(event, dict) else str(event)
+            else:
                 continue
 
             # Regular text chunk (string) - ACCUMULATE, don't replace!
@@ -593,8 +636,11 @@ async def handle_forwarded_message(message: Message, state: FSMContext) -> None:
                 # Regular response - escape HTML for safety
                 formatted_response = escape_html(full_response)
 
-            # Only send if text changed from last update (avoid duplicate)
-            if formatted_response != last_sent_text:
+            # Create bot_message if not already created
+            if not bot_message:
+                bot_message = await message.answer(formatted_response, parse_mode="HTML")
+            # Only edit if text changed from last update (avoid duplicate)
+            elif formatted_response != last_sent_text:
                 await edit_and_send_parts(bot_message, formatted_response)
                 edit_count += 1
 
@@ -616,4 +662,12 @@ async def handle_forwarded_message(message: Message, state: FSMContext) -> None:
         await message.answer(
             "❌ Sorry, I encountered an error while analyzing the forwarded message. Please try again."
         )
+    finally:
+        # Stop typing indicator
+        if 'typing_task' in locals() and typing_task:
+            typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
 

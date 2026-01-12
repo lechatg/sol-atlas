@@ -15,6 +15,7 @@ from loguru import logger
 from luka_bot.core.config import settings
 from luka_bot.services.thread_service import get_thread_service
 from luka_bot.services.user_profile_service import get_user_profile_service
+from luka_bot.services.default_groups_service import get_default_groups_service
 from luka_bot.services.welcome_prompts import get_welcome_message
 from luka_bot.services.prompt_pool_service import get_prompt_pool_service, PromptOption
 from luka_bot.services.user_kb_scope_service import get_user_kb_scope_service
@@ -30,6 +31,33 @@ router = Router()
 
 # Old inline keyboard functions removed - now using reply keyboard
 # See luka_bot/keyboards/start_menu.py for new implementation
+
+
+async def _build_tasks_keyboard(tasks: list, language: str = "en"):
+    """
+    Build inline keyboard from chatbot_start tasks.
+    
+    Args:
+        tasks: List of TaskSchema from camunda_service.get_user_tasks()
+        language: User language for i18n
+        
+    Returns:
+        InlineKeyboardMarkup with task buttons, or None if no tasks
+    """
+    try:
+        if not tasks:
+            return None
+            
+        from luka_bot.keyboards.camunda_tasks_inline import build_camunda_tasks_inline_keyboard
+        
+        # Build tasks keyboard
+        tasks_keyboard = await build_camunda_tasks_inline_keyboard(tasks, language=language)
+        logger.debug(f"✅ Built inline keyboard with {len(tasks)} chatbot_start tasks")
+        return tasks_keyboard
+        
+    except Exception as e:
+        logger.error(f"❌ Error building tasks keyboard: {e}")
+        return None
 
 
 async def _delete_keyboard_setup_message(msg) -> None:
@@ -105,25 +133,84 @@ async def handle_start(message: Message, state: FSMContext, command: CommandObje
             await state.set_data(data_copy)
             form_state_cleared = True
         
-        # Set navigation state to groups_mode (since we show groups keyboard)
-        await state.set_state(NavigationStates.groups_mode)
-        
         if form_state_cleared:
             logger.debug(f"✅ Form state cleared - user {user_id} can now interact normally")
         
         bot_name = settings.LUKA_NAME
         lang = profile.language
         
-        # Build welcome text (no Quick Actions here)
+        # Build invitation section for default group/channel
+        # Simply use env variables for invite links - simpler and more reliable
+        invitation_section = ""
+        default_groups_service = get_default_groups_service()
+        
+        # Auto-provision default group and channel
+        await default_groups_service.provision_default_group_for_user(user_id)
+        await default_groups_service.provision_default_channel_for_user(user_id)
+        
+        invitation_lines = []
+        
+        # Check for default group invite link
+        group_invite_link = settings.get_default_group_invite_link()
+        if group_invite_link and settings.has_default_group:
+            invitation_lines.append(
+                f"• 👥 <a href='{group_invite_link}'>{settings.LUKA_DEFAULT_GROUP_TITLE}</a>"
+            )
+        
+        # Check for default channel invite link
+        channel_invite_link = settings.get_default_channel_invite_link()
+        if channel_invite_link and settings.has_default_channel:
+            invitation_lines.append(
+                f"• 📢 <a href='{channel_invite_link}'>{settings.LUKA_DEFAULT_CHANNEL_TITLE}</a>"
+            )
+        
+        if invitation_lines:
+            invitation_section = f"\n\n{_('actions.invitation_header', lang)}\n" + "\n".join(invitation_lines)
+        
+        # Build welcome text with Quick Actions and invitation
         welcome_text = f"""{_('actions.welcome', lang, first_name=first_name)}
 
-{_('actions.intro', lang, bot_name=bot_name)}"""
-        
+{_('actions.intro', lang, bot_name=bot_name)}{invitation_section}"""
+
         # Get groups for KB scope and prompts personalization
         from luka_bot.services.group_service import get_group_service
         
         group_service = await get_group_service()
         group_links = await group_service.list_user_groups(user_id, active_only=True)
+        
+        # FIX: If user has no groups, set up regular DM thread instead of groups_mode
+        # This allows users without groups to use tripplanner and other features
+        if not group_links:
+            logger.info(f"📝 User {user_id} has no groups - setting up regular DM thread")
+            
+            # Ensure a regular DM thread is active
+            thread_service = get_thread_service()
+            active_thread_id = await thread_service.get_active_thread(user_id)
+            
+            if not active_thread_id:
+                # Create a new thread for the user (this automatically sets it as active)
+                thread = await thread_service.create_thread(user_id, "New Chat")
+                active_thread_id = thread.thread_id
+                logger.info(f"✅ Created new DM thread {active_thread_id} for user {user_id}")
+            else:
+                logger.info(f"✅ Using existing active thread {active_thread_id} for user {user_id}")
+            
+            # Set KB scope to "all" (will search user's personal KB)
+            scope_service = get_user_kb_scope_service()
+            scope = await scope_service.set_custom_scope(user_id, [])  # Empty list = all sources
+            
+            # DON'T set groups_mode - let regular streaming handler work
+            # Clear state to allow regular streaming (thread is already active)
+            # Then set kb_scope so it's available for the LLM service
+            await state.clear()
+            await state.update_data(kb_scope=scope.to_dict())
+            
+            logger.info(f"✅ Set up regular DM mode for user {user_id} (no groups)")
+        else:
+            # User has groups - use groups_mode as before
+            # Set navigation state to groups_mode (since we show groups keyboard)
+            await state.set_state(NavigationStates.groups_mode)
+            logger.info(f"✅ Set groups_mode for user {user_id} with {len(group_links)} groups")
         
         # Add quick prompt keyboard and KB scope functionality
         try:
@@ -133,13 +220,50 @@ async def handle_start(message: Message, state: FSMContext, command: CommandObje
             process_cache = get_process_definition_cache()
             has_chatbot_start = process_cache.has_process("chatbot_start")
 
+            # Start chatbot_start process and fetch tasks
+            tasks = []
             if has_chatbot_start:
-                # Start chatbot_start BPMN in background
-                asyncio.create_task(ensure_chatbot_start_running(
-                    user_id=str(user_id),
+                # Get Flow API UUID for CamundaService calls
+                from luka_bot.services.user_session_cache import get_flow_api_uuid
+                flow_api_uuid = await get_flow_api_uuid(user_id)
+
+                # Await chatbot_start BPMN to ensure it's ready
+                process_instance_id, was_just_created = await ensure_chatbot_start_running(
+                    user_id=flow_api_uuid,
                     telegram_user_id=user_id,
                     chat_id=message.chat.id
-                ))
+                )
+
+                if process_instance_id:
+                    logger.info(f"✅ chatbot_start process started for user {user_id}: {process_instance_id}")
+
+                    # Fetch tasks from the chatbot_start process
+                    from luka_bot.services.camunda_service import CamundaService
+                    import asyncio
+                    camunda_service = CamundaService.get_instance()
+
+                    # Try fetching tasks, with retry for newly created processes
+                    # (subprocesses need time to initialize)
+                    max_attempts = 3 if was_just_created else 1
+                    retry_delay = 1.5  # seconds
+
+                    for attempt in range(max_attempts):
+                        tasks = await camunda_service.get_user_tasks(
+                            user_id=flow_api_uuid,
+                            process_definition_key="chatbot_start"
+                        )
+
+                        # If we found multiple tasks or this is the last attempt, use these
+                        if len(tasks) > 1 or attempt == max_attempts - 1:
+                            logger.info(f"📋 Retrieved {len(tasks)} tasks from chatbot_start for user {user_id}")
+                            break
+
+                        # If only 1 task found and we have more attempts, wait for subprocesses
+                        if attempt < max_attempts - 1:
+                            logger.debug(f"Only {len(tasks)} task(s) found, waiting {retry_delay}s for subprocesses (attempt {attempt + 1}/{max_attempts})")
+                            await asyncio.sleep(retry_delay)
+                else:
+                    logger.warning(f"⚠️ Failed to start chatbot_start process for user {user_id}")
             else:
                 logger.debug(f"chatbot_start process not deployed - skipping process start for user {user_id}")
 
@@ -169,13 +293,17 @@ async def handle_start(message: Message, state: FSMContext, command: CommandObje
             else:
                 await state.update_data(quick_prompts=[])
             
-            # Set up KB scope
-            scope_service = get_user_kb_scope_service()
-            available_group_ids = [str(link.group_id) for link in group_links if link.group_id]
-            scope = await scope_service.refresh_scope_from_groups(user_id, available_group_ids)
-            await state.update_data(kb_scope=scope.to_dict())
+            # Set up KB scope (only if user has groups, otherwise already set above)
+            if group_links:
+                scope_service = get_user_kb_scope_service()
+                available_group_ids = [str(link.group_id) for link in group_links if link.group_id]
+                scope = await scope_service.refresh_scope_from_groups(user_id, available_group_ids)
+                await state.update_data(kb_scope=scope.to_dict())
             
-            # Build and send start reply keyboard (prompts + emoji scope controls)
+            # Build inline keyboard for tasks (if available)
+            tasks_inline_keyboard = await _build_tasks_keyboard(tasks, lang) if tasks else None
+            
+            # Build reply keyboard (prompts + emoji scope controls) for follow-up message
             from luka_bot.keyboards.start_menu import build_start_reply_keyboard
             
             start_keyboard = await build_start_reply_keyboard(
@@ -184,60 +312,30 @@ async def handle_start(message: Message, state: FSMContext, command: CommandObje
                 language=lang
             )
             
-            # Fetch Camunda tasks first (before sending welcome message)
-            tasks_inline = None
-            if has_chatbot_start:
-                try:
-                    from luka_bot.keyboards.camunda_tasks_inline import build_camunda_tasks_inline_keyboard
-                    from luka_bot.services.camunda_service import CamundaService
-
-                    camunda_service = CamundaService.get_instance()
-                    # Filter tasks to only show chatbot_start tasks
-                    user_tasks = await camunda_service.get_user_tasks(
-                        user_id,
-                        process_definition_key="chatbot_start"
-                    )
-
-                    tasks_inline = await build_camunda_tasks_inline_keyboard(
-                        user_tasks,
-                        language=lang
-                    )
-
-                    logger.info(f"📋 Built inline keyboard with {len(user_tasks)} chatbot_start tasks for user {user_id}")
-                except Exception as camunda_error:
-                    logger.warning(f"Failed to fetch Camunda tasks for user {user_id}: {camunda_error}")
-                    tasks_inline = None
+            # Send welcome message with task buttons attached (if available)
+            # If no tasks, attach reply keyboard instead
+            keyboard_to_use = tasks_inline_keyboard if tasks_inline_keyboard else start_keyboard
             
-            # Send welcome message with tasks inline keyboard (if available)
-            if tasks_inline:
-                # Send welcome message with tasks inline keyboard attached
-                welcome_msg = await message.answer(
-                    welcome_text,
-                    reply_markup=tasks_inline,
-                    parse_mode="HTML"
-                )
-                logger.info(f"📋 Sent welcome message with tasks inline keyboard to user {user_id}")
+            sent_message = await message.answer(
+                welcome_text,
+                reply_markup=keyboard_to_use,
+                parse_mode="HTML"
+            )
+            
+            # Store message info for WebSocket updates (when tasks arrive later)
+            await state.update_data(
+                start_message_id=sent_message.message_id,
+                start_message_chat_id=sent_message.chat.id,
+                start_message_has_tasks=bool(tasks)
+            )
+            
+            if tasks:
+                logger.info(f"📝 Sent welcome message with {len(tasks)} task buttons attached to user {user_id}")
+                
+                # Also send reply keyboard for prompts in a follow-up message (optional)
+                # Removed to keep it to ONE message as user requested
             else:
-                # No tasks - send welcome with reply keyboard only
-                welcome_msg = await message.answer(
-                    welcome_text,
-                    reply_markup=start_keyboard,
-                    parse_mode="HTML"
-                )
-                logger.info(f"📝 Sent welcome message with start reply keyboard to user {user_id}")
-            
-            # Set reply keyboard at chat level (separate from inline keyboard)
-            # Reply keyboards persist at chat level, so we set it separately
-            if tasks_inline:
-                # Tasks menu is on welcome message, so set reply keyboard separately
-                # Send minimal message to activate reply keyboard (will be auto-deleted)
-                kb_msg = await message.answer(
-                    " ",  # Minimal space character
-                    reply_markup=start_keyboard
-                )
-                # Delete the keyboard setup message after a brief delay
-                # (Bot can't delete its own message immediately)
-                asyncio.create_task(_delete_keyboard_setup_message(kb_msg))
+                logger.info(f"📝 Sent welcome message with reply keyboard to user {user_id} (no tasks)")
         
         except Exception as e:
             logger.warning(f"Failed to add quick prompts for user {user_id}: {e}")
@@ -463,6 +561,7 @@ async def handle_deep_link_payload(message: Message, state: FSMContext, payload:
             from luka_bot.services.moderation_service import get_moderation_service
             
             moderation_service = await get_moderation_service()
+            from luka_bot.services.group_service import get_group_service
             group_service = await get_group_service()
             
             settings = await moderation_service.get_group_settings(group_id)
@@ -520,7 +619,7 @@ async def handle_deep_link_payload(message: Message, state: FSMContext, payload:
                 parse_mode="HTML"
             )
             return True
-            
+
     except Exception as e:
         logger.error(f"Failed to handle deep link payload '{payload}': {e}")
     
@@ -559,43 +658,8 @@ async def show_onboarding_welcome(message: Message, profile, payload: str = None
     
     logger.info(f"🌍 Detected language '{detected_lang}' for user {user_id} from Telegram locale '{telegram_lang}'")
     
-    # Add context if user came from a group
-    context_text = ""
-    if payload and payload.startswith("group_"):
-        context_text = "\n\n<i>💡 I see you came from a group! After setup, you'll be able to search that group's history.</i>\n"
-    elif payload and payload.startswith("admin_"):
-        context_text = "\n\n<i>⭐ I see you're a group admin! After setup, you'll get access to admin controls.</i>\n"
-    
-    # Show Step 1 with detected language
-    bot_name = settings.LUKA_NAME
-    step1_text = f"""{_('onboarding.step1_hook', detected_lang, bot_name=bot_name)}
-{context_text}
-{_('onboarding.step1_capabilities_header', detected_lang)}
-{_('onboarding.step1_cap_threads', detected_lang)}
-{_('onboarding.step1_cap_tasks', detected_lang)}
-{_('onboarding.step1_cap_summarize', detected_lang)}
-{_('onboarding.step1_cap_kb', detected_lang)}
-
-{_('onboarding.step1_try_now', detected_lang)}
-{_('onboarding.step1_example_1', detected_lang)}
-{_('onboarding.step1_example_2', detected_lang)}
-{_('onboarding.step1_example_3', detected_lang)}"""
-    
-    # Optional language change button
-    language_name = "English" if detected_lang == "en" else "Русский"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text=f"🌍 Change Language ({language_name})",
-                callback_data="onboarding_change_lang"
-            )
-        ]
-    ])
-    
-    await message.answer(step1_text, reply_markup=keyboard, parse_mode="HTML")
-    logger.info(f"📋 Showed onboarding Step 1 to user {user_id} in {detected_lang}")
-    
-    # Add quick prompt keyboard for new users
+    # Start chatbot_start process and fetch tasks BEFORE building the message
+    # This way we can include task buttons in the same onboarding message
     try:
         # Check if chatbot_start process exists before trying to start it
         from luka_bot.services.process_definition_cache import get_process_definition_cache
@@ -603,13 +667,49 @@ async def show_onboarding_welcome(message: Message, profile, payload: str = None
         process_cache = get_process_definition_cache()
         has_chatbot_start = process_cache.has_process("chatbot_start")
 
+        # Start chatbot_start process and fetch tasks
+        tasks = []
         if has_chatbot_start:
-            # Start chatbot_start BPMN in background
-            asyncio.create_task(ensure_chatbot_start_running(
+            # Await chatbot_start BPMN to ensure it's ready
+            process_instance_id, was_just_created = await ensure_chatbot_start_running(
                 user_id=str(user_id),
                 telegram_user_id=user_id,
                 chat_id=message.chat.id
-            ))
+            )
+            
+            if process_instance_id:
+                logger.info(f"✅ chatbot_start process started for new user {user_id}: {process_instance_id}")
+                
+                # Fetch tasks from the chatbot_start process
+                from luka_bot.services.camunda_service import CamundaService
+                import asyncio
+                camunda_service = CamundaService.get_instance()
+                
+                # Try fetching tasks, with retry for newly created processes
+                max_attempts = 3 if was_just_created else 1
+                retry_delay = 1.5  # seconds
+                
+                # Get Flow API UUID for CamundaService
+                from luka_bot.services.user_session_cache import get_flow_api_uuid
+                flow_api_uuid = await get_flow_api_uuid(user_id)
+
+                for attempt in range(max_attempts):
+                    tasks = await camunda_service.get_user_tasks(
+                        user_id=flow_api_uuid,
+                        process_definition_key="chatbot_start"
+                    )
+                    
+                    # If we found multiple tasks or this is the last attempt, use these
+                    if len(tasks) > 1 or attempt == max_attempts - 1:
+                        break
+                    
+                    # If only 1 task found and we have more attempts, wait for subprocesses
+                    if attempt < max_attempts - 1:
+                        logger.debug(f"Waiting {retry_delay}s for chatbot_start subprocesses (attempt {attempt + 1}/{max_attempts})")
+                        await asyncio.sleep(retry_delay)
+                logger.info(f"📋 Retrieved {len(tasks)} tasks from chatbot_start for new user {user_id}")
+            else:
+                logger.warning(f"⚠️ Failed to start chatbot_start process for new user {user_id}")
         else:
             logger.debug(f"chatbot_start process not deployed - skipping process start for new user {user_id}")
 
@@ -659,68 +759,63 @@ async def show_onboarding_welcome(message: Message, profile, payload: str = None
         from luka_bot.core.loader import dp
         fsm_context = dp.fsm.get_context(message.bot, user_id, user_id)
         await fsm_context.update_data(kb_scope=scope.to_dict())
-        
-        # Build and send start reply keyboard (prompts + emoji scope controls)
-        from luka_bot.keyboards.start_menu import build_start_reply_keyboard
-        
-        start_keyboard = await build_start_reply_keyboard(
-            prompt_options or [],
-            include_scope_controls=bool(group_links),
-            language=detected_lang
-        )
-        
-        # Fetch Camunda tasks first (before sending welcome message)
-        tasks_inline = None
-        if has_chatbot_start:
-            try:
-                from luka_bot.keyboards.camunda_tasks_inline import build_camunda_tasks_inline_keyboard
-                from luka_bot.services.camunda_service import CamundaService
-
-                camunda_service = CamundaService.get_instance()
-                # Filter tasks to only show chatbot_start tasks
-                user_tasks = await camunda_service.get_user_tasks(
-                    user_id,
-                    process_definition_key="chatbot_start"
-                )
-
-                tasks_inline = await build_camunda_tasks_inline_keyboard(
-                    user_tasks,
-                    language=detected_lang
-                )
-
-                logger.info(f"📋 Built inline keyboard with {len(user_tasks)} chatbot_start tasks for new user {user_id}")
-            except Exception as camunda_error:
-                logger.warning(f"Failed to fetch Camunda tasks for new user {user_id}: {camunda_error}")
-                tasks_inline = None
-        
-        # Send welcome with tasks inline keyboard (if available) or reply keyboard
-        prompt_intro = _("onboarding_quick_questions_intro", detected_lang)
-        if tasks_inline:
-            # Send welcome message with tasks inline keyboard attached
-            welcome_msg = await message.answer(
-                prompt_intro,
-                reply_markup=tasks_inline,
-                parse_mode="HTML"
-            )
-            logger.info(f"📋 Sent onboarding welcome with tasks inline keyboard to new user {user_id}")
-            
-            # Set reply keyboard separately
-            kb_msg = await message.answer(
-                " ",
-                reply_markup=start_keyboard
-            )
-            asyncio.create_task(_delete_keyboard_setup_message(kb_msg))
-        else:
-            # No tasks - send welcome with reply keyboard only
-            welcome_msg = await message.answer(
-                prompt_intro,
-                reply_markup=start_keyboard,
-                parse_mode="HTML"
-            )
-            logger.info(f"📝 Sent onboarding welcome with start reply keyboard to new user {user_id}")
     
     except Exception as e:
-        logger.warning(f"Failed to add quick prompts for new user {user_id}: {e}")
+        logger.warning(f"Failed to fetch tasks for new user {user_id}: {e}")
+        tasks = []
+    
+    # Now build the onboarding message with all the content
+    # Add context if user came from a group
+    context_text = ""
+    if payload and payload.startswith("group_"):
+        context_text = "\n\n<i>💡 I see you came from a group! After setup, you'll be able to search that group's history.</i>\n"
+    elif payload and payload.startswith("admin_"):
+        context_text = "\n\n<i>⭐ I see you're a group admin! After setup, you'll get access to admin controls.</i>\n"
+    
+    # Build Step 1 text
+    bot_name = settings.LUKA_NAME
+    step1_text = f"""{_('onboarding.step1_hook', detected_lang, bot_name=bot_name)}
+{context_text}
+{_('onboarding.step1_capabilities_header', detected_lang)}
+{_('onboarding.step1_cap_threads', detected_lang)}
+{_('onboarding.step1_cap_tasks', detected_lang)}
+{_('onboarding.step1_cap_summarize', detected_lang)}
+{_('onboarding.step1_cap_kb', detected_lang)}
+
+{_('onboarding.step1_try_now', detected_lang)}
+{_('onboarding.step1_example_1', detected_lang)}
+{_('onboarding.step1_example_2', detected_lang)}
+{_('onboarding.step1_example_3', detected_lang)}"""
+    
+    # Build combined inline keyboard with Change Language button + task buttons
+    from luka_bot.keyboards.camunda_tasks_inline import build_camunda_tasks_inline_keyboard
+    
+    keyboard_buttons = []
+    
+    # Add task buttons first (if available)
+    if tasks:
+        tasks_keyboard = await build_camunda_tasks_inline_keyboard(tasks, language=detected_lang)
+        # Add all task buttons
+        keyboard_buttons.extend(tasks_keyboard.inline_keyboard)
+    
+    # Add Change Language button at the bottom
+    language_name = "English" if detected_lang == "en" else "Русский"
+    keyboard_buttons.append([
+        InlineKeyboardButton(
+            text=f"🌍 {language_name}",
+            callback_data="onboarding_change_lang"
+        )
+    ])
+    
+    combined_keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    # Send ONE message with onboarding content + task buttons + language button
+    await message.answer(step1_text, reply_markup=combined_keyboard, parse_mode="HTML")
+    
+    if tasks:
+        logger.info(f"✅ Showed onboarding to user {user_id} with {len(tasks)} task buttons + language switcher")
+    else:
+        logger.info(f"✅ Showed onboarding to user {user_id} with language switcher (no tasks)")
 
 
 @router.callback_query(lambda c: c.data == "onboarding_change_lang")
@@ -1324,11 +1419,11 @@ async def handle_scope_cancel(callback_query: CallbackQuery, state: FSMContext) 
 # Reply Keyboard Handlers (Start Menu)
 # ============================================================================
 
-@router.message(lambda m: m.text and m.text not in ["⚙️", "🌐", "🎯"] and len(m.text) > 10)
+@router.message(lambda m: m.text and m.text not in ["⚙️", "🌐", "🎯"] and len(m.text) > 10 and not m.text.startswith("/"))
 async def handle_quick_prompt_reply(message: Message, state: FSMContext) -> None:
     """
     Handle quick prompt from reply keyboard.
-    Matches any text button that's not a scope control emoji.
+    Matches any text button that's not a scope control emoji or command.
     """
     prompt_text = message.text.strip()
     

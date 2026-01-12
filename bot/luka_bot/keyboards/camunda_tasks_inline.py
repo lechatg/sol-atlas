@@ -10,58 +10,58 @@ from loguru import logger
 from luka_bot.utils.i18n_helper import _
 
 
+def _get_task_emoji(task_id: str) -> str:
+    """
+    Generate a varied emoji for each task based on task ID.
+
+    Uses task ID hash to pick from a diverse set of emojis.
+    """
+    emojis = [
+        "📋", "✅", "🎯", "💡", "🚀", "⭐", "🔥", "💼",
+        "📝", "🎨", "🔧", "⚡", "🎪", "🎭", "🎬", "🎮",
+        "🎲", "🎯", "🎪", "🎨", "🔔", "🔑", "🔨", "🔬",
+        "📌", "📍", "📎", "📊", "📈", "📉", "📱", "💎"
+    ]
+    # Use hash of task_id to consistently pick emoji for same task
+    emoji_index = hash(task_id) % len(emojis)
+    return emojis[emoji_index]
+
+
 async def build_camunda_tasks_inline_keyboard(
     tasks: List,  # List of TaskSchema from camunda_client
     language: str = "en"
 ) -> InlineKeyboardMarkup:
     """
     Build inline keyboard with Camunda tasks from chatbot_start process.
-    
+
     Layout:
-    - Each task = one button (task.name)
+    - Each task = one button per row
     - callback_data = "task:{task_id}"
-    - Max 10 tasks for clean UI
-    
+    - No limit on number of tasks
+
     Args:
         tasks: List of TaskSchema from chatbot_start process
-        language: User language (for "no tasks" message)
-        
+        language: User language (not used, kept for compatibility)
+
     Returns:
         Inline keyboard markup
     """
     buttons = []
-    
-    if not tasks:
-        # No tasks available - show info button
+
+    # Show all tasks, one per row
+    for task in tasks:
+        # Task name from BPMN definition
+        task_name = task.name or f"Task {task.id[:8]}"
+        # Get varied emoji for this task
+        emoji = _get_task_emoji(task.id)
+
         buttons.append([
             InlineKeyboardButton(
-                text=_("start.no_tasks_available", language),
-                callback_data="no_tasks"
+                text=f"{emoji} {task_name}",
+                callback_data=f"task:{task.id}"
             )
         ])
-    else:
-        # Show up to 12 most recent tasks (4 rows of 3)
-        display_tasks = tasks[:12]
-        
-        # Build task buttons (3 per row)
-        for i in range(0, len(display_tasks), 3):
-            row = []
-            for j in range(3):
-                if i + j < len(display_tasks):
-                    task = display_tasks[i + j]
-                    # Task name from BPMN definition (truncate for inline)
-                    task_name = task.name or f"Task {task.id[:8]}"
-                    # Truncate task name to fit 3 per row
-                    if len(task_name) > 15:
-                        task_name = task_name[:12] + "..."
-                    
-                    row.append(InlineKeyboardButton(
-                        text=f"📋 {task_name}",
-                        callback_data=f"task:{task.id}"
-                    ))
-            if row:
-                buttons.append(row)
-    
-    logger.info(f"📋 Created Camunda tasks inline keyboard with {len(display_tasks) if tasks else 0} tasks (3 per row)")
+
+    logger.info(f"📋 Created Camunda tasks inline keyboard with {len(tasks)} tasks (one per row)")
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 

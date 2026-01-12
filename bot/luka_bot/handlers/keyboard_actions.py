@@ -1001,9 +1001,10 @@ class GroupSelectionFilter(BaseFilter):
         if text in ["🏘 Groups", "🏘 Группы"]:
             return False
         
-        # Skip other control buttons (have their own handlers)
-        if text in ["➕ New Group", "➕ Новая группа", "⚙️ Default Settings", "⚙️ Настройки по умолчанию"]:
-            return False
+        # Skip other control buttons (now handled by inline keyboard, so no longer need to check)
+        # "➕ New Group" and "⚙️ Default Settings" are now inline buttons, not reply buttons
+        # if text in ["➕ New Group", "➕ Новая группа"]:
+        #     return False
         
         try:
             group_service = await get_group_service()
@@ -1056,7 +1057,6 @@ async def handle_group_selection(message: Message, state: FSMContext) -> None:
         
         if not group_thread:
             # Thread missing (e.g., after /reset), recreate it
-            from luka_bot.services.group_service import get_group_service
             group_service = await get_group_service()
             
             # Get group metadata for title
@@ -1099,6 +1099,11 @@ async def handle_group_selection(message: Message, state: FSMContext) -> None:
         intro_text = _('groups.intro', lang, count=len(groups))
         await message.answer(intro_text, parse_mode="HTML", reply_markup=keyboard)
 
+        # Send inline actions keyboard
+        from luka_bot.keyboards.groups_actions_inline import build_groups_actions_inline_keyboard
+        actions_inline = await build_groups_actions_inline_keyboard(language=lang)
+        await message.answer("🔧 Group Actions", reply_markup=actions_inline)
+
         # Send GROUP divider with updated inline controls
         await send_group_divider(
             user_id=user_id,
@@ -1114,50 +1119,53 @@ async def handle_group_selection(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Error switching group. Please try again.")
 
 
-@router.message(F.text.in_(["➕ New Group", "➕ Новая группа"]))
-async def handle_new_group_button(message: Message, state: FSMContext) -> None:
+@router.callback_query(F.data == "groups:new_group")
+async def handle_groups_new_group_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
     """
-    Handle '+ New Group' button.
+    Handle 'New Group' inline button click.
     
     Shows instructions for adding bot to a new group.
     """
-    user_id = message.from_user.id if message.from_user else None
+    user_id = callback_query.from_user.id if callback_query.from_user else None
     if not user_id:
+        await callback_query.answer("❌ Error", show_alert=True)
         return
     
-    logger.info(f"➕ User {user_id} clicked New Group button")
+    logger.info(f"➕ User {user_id} clicked New Group inline button")
     
     try:
         lang = await get_user_language(user_id)
         
         # Get bot username
-        bot_info = await message.bot.get_me()
+        bot_info = await callback_query.bot.get_me()
         bot_username = bot_info.username
         
         # Instructions for adding bot to group
         instructions = _('groups.add_instructions', lang, bot_username=bot_username)
         
-        await message.answer(instructions, parse_mode="HTML")
+        await callback_query.message.answer(instructions, parse_mode="HTML")
+        await callback_query.answer()
         
         logger.info(f"✅ Showed add group instructions to user {user_id}")
         
     except Exception as e:
         logger.error(f"❌ Error showing add group instructions: {e}")
-        await message.answer("❌ Error. Please try again.")
+        await callback_query.answer("❌ Error. Please try again.", show_alert=True)
 
 
-@router.message(F.text.in_(["⚙️ Default Settings", "⚙️ Настройки по умолчанию"]))
-async def handle_default_settings_button(message: Message, state: FSMContext) -> None:
+@router.callback_query(F.data == "groups:default_settings")
+async def handle_groups_default_settings_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
     """
-    Handle 'Default Settings' button.
+    Handle 'Default Settings' inline button click.
     
     Shows user's default group settings (applied to new groups).
     """
-    user_id = message.from_user.id if message.from_user else None
+    user_id = callback_query.from_user.id if callback_query.from_user else None
     if not user_id:
+        await callback_query.answer("❌ Error", show_alert=True)
         return
     
-    logger.info(f"⚙️ User {user_id} clicked Default Settings button")
+    logger.info(f"⚙️ User {user_id} clicked Default Settings inline button")
     
     try:
         lang = await get_user_language(user_id)
@@ -1189,14 +1197,15 @@ async def handle_default_settings_button(message: Message, state: FSMContext) ->
             is_user_defaults=True
         )
         
-        await message.answer(
+        await callback_query.message.answer(
             text,
             reply_markup=keyboard,
             parse_mode="HTML"
         )
+        await callback_query.answer()
         
         logger.info(f"✅ Showed default settings to user {user_id}")
         
     except Exception as e:
         logger.error(f"❌ Error showing default settings: {e}", exc_info=True)
-        await message.answer("❌ Error loading settings. Please try again.")
+        await callback_query.answer("❌ Error loading settings. Please try again.", show_alert=True)

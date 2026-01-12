@@ -31,7 +31,7 @@ def _format_toggle_text(
 
 
 def create_group_admin_menu(
-    group_id: int, 
+    group_id: int,
     group_title: str = None,
     moderation_enabled: bool = True,
     stoplist_count: int = 0,
@@ -45,7 +45,7 @@ def create_group_admin_menu(
     """
     Create hierarchical admin menu - main settings level.
     Used for BOTH group settings AND user defaults (same menu, different data source).
-    
+
     New structure:
     - Row 1: Silent Mode toggle | AI Assistant submenu →
     - Row 2: Moderation submenu → | Import History (groups) / Moderation (user defaults)
@@ -53,7 +53,7 @@ def create_group_admin_menu(
     - Row 4: Link All Members (groups only)
     - Row 5: Delete Group (groups only)
     - Row 6: Back | Reset to Defaults
-    
+
     Args:
         group_id: Group chat ID (or user_id for defaults)
         group_title: Optional group title for display
@@ -65,13 +65,13 @@ def create_group_admin_menu(
         kb_indexation_enabled: Whether KB indexation is enabled
         moderate_admins_enabled: Whether to moderate admins
         is_user_defaults: If True, hides group-specific items (import, delete, refresh)
-        
+
     Returns:
         InlineKeyboardMarkup with hierarchical navigation
     """
     # Build button rows dynamically
     buttons = []
-    
+
     # Row 1: Silent Mode toggle | AI Assistant submenu
     buttons.append([
         InlineKeyboardButton(
@@ -90,7 +90,7 @@ def create_group_admin_menu(
             callback_data=f"ai_assistant_menu:{group_id}"
         )
     ])
-    
+
     # Row 2: Moderation submenu | Import History
     if not is_user_defaults:
         # Groups: Show Import History
@@ -112,7 +112,7 @@ def create_group_admin_menu(
                 callback_data=f"moderation_menu:{group_id}"
             )
         ])
-    
+
     # Row 3: Language selection (for both groups and user defaults)
     lang_display = "🇬🇧 English" if current_language == "en" else "🇷🇺 Русский"
     lang_button_text = f"🌐 {_('group.btn.language', current_language)}: {lang_display}"
@@ -122,7 +122,7 @@ def create_group_admin_menu(
             callback_data=f"group_lang_menu:{group_id}"
         )
     ])
-    
+
     # Group-specific buttons (hidden for user defaults)
     if not is_user_defaults:
         # Row 4: Link All Members (Backfill)
@@ -133,7 +133,7 @@ def create_group_admin_menu(
                 callback_data=f"group_backfill:{group_id}"
             )
         ])
-        
+
         # Row 5: Delete Group
         buttons.append([
             InlineKeyboardButton(
@@ -141,7 +141,7 @@ def create_group_admin_menu(
                 callback_data=f"group_delete_confirm:{group_id}"
             )
         ])
-    
+
     # Row 6: Back | Reset to Defaults
     back_reset_row = [
         InlineKeyboardButton(
@@ -149,7 +149,7 @@ def create_group_admin_menu(
             callback_data=f"close_menu:{group_id}"
         )
     ]
-    
+
     # Add Reset button
     if is_user_defaults:
         # User defaults: Reset to factory/app defaults
@@ -167,21 +167,21 @@ def create_group_admin_menu(
                 callback_data=f"group_reset_to_user_defaults:{group_id}"
             )
         )
-    
+
     buttons.append(back_reset_row)
-    
+
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def create_system_messages_menu(group_id: int, enabled_types: list[str], language: str = "en") -> InlineKeyboardMarkup:
     """
     Create system messages filter menu with checkmarks in button names.
-    
+
     Args:
         group_id: Group chat ID
         enabled_types: List of enabled message type groups
         language: Language code for translations
-        
+
     Returns:
         InlineKeyboardMarkup with toggle buttons
     """
@@ -208,22 +208,22 @@ def create_system_messages_menu(group_id: int, enabled_types: list[str], languag
             "types": ["new_chat_photo", "delete_chat_photo"]
         }
     }
-    
+
     buttons = []
     for key, config in type_groups.items():
         # enabled_types contains types we hide; invert for UX (✅ show, ❌ hide)
         is_filtered = any(t in enabled_types for t in config["types"])
         icon = "❌" if is_filtered else "✅"
-        
+
         label = _(config['i18n_key'], language)
-        
+
         buttons.append([
             InlineKeyboardButton(
                 text=f"{icon} {label}",
                 callback_data=f"sys_msg_toggle:{key}:{group_id}"
             )
         ])
-    
+
     # Add back button - return to Moderation menu
     buttons.append([
         InlineKeyboardButton(
@@ -231,19 +231,19 @@ def create_system_messages_menu(group_id: int, enabled_types: list[str], languag
             callback_data=f"moderation_menu:{group_id}"
         )
     ])
-    
+
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def create_content_types_menu(group_id: int, settings, language: str = "en") -> InlineKeyboardMarkup:
     """
     Create content types filter menu with checkmarks.
-    
+
     Args:
         group_id: Group chat ID (or user_id for defaults)
         settings: GroupSettings object with delete_* flags
         language: Language code for translations
-        
+
     Returns:
         InlineKeyboardMarkup with toggle buttons
     """
@@ -275,21 +275,21 @@ def create_content_types_menu(group_id: int, settings, language: str = "en") -> 
             "attr": "delete_forwarded"
         }
     ]
-    
+
     buttons = []
     for content_type in content_types:
         is_filtered = getattr(settings, content_type["attr"], False)
         checkmark = "❌" if is_filtered else "✅"
-        
+
         label = _(content_type['i18n_key'], language)
-        
+
         buttons.append([
             InlineKeyboardButton(
                 text=f"{checkmark} {label}",
                 callback_data=f"content_type_toggle:{content_type['key']}:{group_id}"
             )
         ])
-    
+
     # Add back button - return to Moderation menu
     buttons.append([
         InlineKeyboardButton(
@@ -297,18 +297,18 @@ def create_content_types_menu(group_id: int, settings, language: str = "en") -> 
             callback_data=f"moderation_menu:{group_id}"
         )
     ])
-    
+
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def create_group_settings_menu(group_id: int, language: str = "en") -> InlineKeyboardMarkup:
     """
     Create group settings menu.
-    
+
     Args:
         group_id: Group chat ID
         language: Language code for translations
-        
+
     Returns:
         InlineKeyboardMarkup with settings options
     """
@@ -343,23 +343,27 @@ def create_group_settings_menu(group_id: int, language: str = "en") -> InlineKey
 def create_ai_assistant_menu(
     group_id: int,
     ai_assistant_enabled: bool = True,
+    respond_to_all_messages: bool = False,
     kb_indexation_enabled: bool = True,
+    manual_kb_gathering_enabled: bool = True,
     language: str = "en"
 ) -> InlineKeyboardMarkup:
     """
     Create AI Assistant submenu with toggle buttons.
-    
+
     Args:
         group_id: Group chat ID
         ai_assistant_enabled: Current AI assistant status
+        respond_to_all_messages: Whether to respond to all messages (not just mentions/replies)
         kb_indexation_enabled: Current KB indexation status
+        manual_kb_gathering_enabled: Whether manual KB gathering prompts are enabled
         language: Language code for translations
-        
+
     Returns:
         InlineKeyboardMarkup with AI Assistant controls
     """
     buttons = []
-    
+
     # Row 1: AI Assistant toggle
     buttons.append([
         InlineKeyboardButton(
@@ -373,8 +377,23 @@ def create_ai_assistant_menu(
             callback_data=f"group_toggle_ai:{group_id}"
         )
     ])
-    
-    # Row 2: Knowledge Base toggle
+
+    # Row 2: Respond to all messages toggle (only shown if AI is enabled)
+    if ai_assistant_enabled:
+        buttons.append([
+            InlineKeyboardButton(
+                text=_format_toggle_text(
+                    "group_settings.respond_to_all",
+                    respond_to_all_messages,
+                    language,
+                    icon_enabled="💬",
+                    icon_disabled="📝"
+                ),
+                callback_data=f"group_toggle_respond_all:{group_id}"
+            )
+        ])
+
+    # Row 3: Knowledge Base toggle
     buttons.append([
         InlineKeyboardButton(
             text=_format_toggle_text(
@@ -387,23 +406,45 @@ def create_ai_assistant_menu(
             callback_data=f"group_toggle_kb:{group_id}"
         )
     ])
-    
-    # Row 3: Bot Instructions
+
+    # Row 4: Manual KB Gathering toggle
+    buttons.append([
+        InlineKeyboardButton(
+            text=_format_toggle_text(
+                "group_settings.manual_kb_gathering",
+                manual_kb_gathering_enabled,
+                language,
+                icon_enabled="➕",
+                icon_disabled="➕"
+            ),
+            callback_data=f"group_toggle_manual_kb:{group_id}"
+        )
+    ])
+
+    # Row 5: Bot Instructions
     buttons.append([
         InlineKeyboardButton(
             text=_('group.btn.bot_instructions', language),
             callback_data=f"moderation_prompt_menu:{group_id}"
         )
     ])
-    
-    # Row 4: Back
+
+    # Row 6: Bot Personality
+    buttons.append([
+        InlineKeyboardButton(
+            text=_('group.btn.bot_personality', language),
+            callback_data=f"bot_personality_menu:{group_id}"
+        )
+    ])
+
+    # Row 7: Back
     buttons.append([
         InlineKeyboardButton(
             text=_('common.back', language),
             callback_data=f"group_admin_menu:{group_id}"
         )
     ])
-    
+
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -415,18 +456,18 @@ def create_moderation_menu(
 ) -> InlineKeyboardMarkup:
     """
     Create Moderation submenu with toggle buttons and links to other submenus.
-    
+
     Args:
         group_id: Group chat ID
         moderation_enabled: Current moderation status
         moderate_admins_enabled: Current moderate admins status
         language: Language code for translations
-        
+
     Returns:
         InlineKeyboardMarkup with Moderation controls
     """
     buttons = []
-    
+
     # Row 1: Moderation toggle
     buttons.append([
         InlineKeyboardButton(
@@ -440,7 +481,7 @@ def create_moderation_menu(
             callback_data=f"group_toggle_mod:{group_id}"
         )
     ])
-    
+
     # Row 2: Moderate Admins toggle
     buttons.append([
         InlineKeyboardButton(
@@ -454,7 +495,7 @@ def create_moderation_menu(
             callback_data=f"group_toggle_mod_admins:{group_id}"
         )
     ])
-    
+
     # Row 3: System Messages submenu
     buttons.append([
         InlineKeyboardButton(
@@ -462,7 +503,7 @@ def create_moderation_menu(
             callback_data=f"sys_msg_menu:{group_id}"
         )
     ])
-    
+
     # Row 4: Content Type Filters submenu
     buttons.append([
         InlineKeyboardButton(
@@ -470,7 +511,7 @@ def create_moderation_menu(
             callback_data=f"content_types_menu:{group_id}"
         )
     ])
-    
+
     # Row 5: Stoplist submenu
     buttons.append([
         InlineKeyboardButton(
@@ -478,7 +519,7 @@ def create_moderation_menu(
             callback_data=f"group_stoplist_config:{group_id}"
         )
     ])
-    
+
     # Row 6: Back
     buttons.append([
         InlineKeyboardButton(
@@ -486,5 +527,5 @@ def create_moderation_menu(
             callback_data=f"group_admin_menu:{group_id}"
         )
     ])
-    
+
     return InlineKeyboardMarkup(inline_keyboard=buttons)

@@ -17,6 +17,7 @@ from luka_bot.services.group_service import get_group_service
 from luka_bot.services.thread_service import get_thread_service
 from luka_bot.services.group_thread_service import get_group_thread_service
 from luka_bot.services.group_divider_service import send_group_divider
+from luka_bot.services.default_groups_service import get_default_groups_service
 from luka_bot.utils.permissions import is_user_admin_in_group
 from luka_bot.handlers.states import NavigationStates
 from luka_bot.core.config import settings
@@ -80,9 +81,17 @@ async def handle_groups_enhanced(message: Message, state: FSMContext) -> None:
     
     # Get services
     group_service = await get_group_service()
+    default_groups_service = get_default_groups_service()
+    
+    # Auto-provision default group and channel if not already present
+    await default_groups_service.provision_default_group_for_user(user_id)
+    await default_groups_service.provision_default_channel_for_user(user_id)
     
     # Get user's groups
     user_groups = await group_service.list_user_groups(user_id, active_only=True)
+    
+    # Sort groups: default group first, then default channel, then rest
+    user_groups = default_groups_service.sort_groups_by_priority(user_groups)
     
     if not user_groups:
         # Empty state - no groups yet
@@ -100,13 +109,24 @@ async def handle_groups_enhanced(message: Message, state: FSMContext) -> None:
             reply_markup=keyboard,
             parse_mode="HTML"
         )
+        
+        # Send inline actions keyboard for empty state
+        from luka_bot.keyboards.groups_actions_inline import build_groups_actions_inline_keyboard
+        actions_inline = await build_groups_actions_inline_keyboard(language=lang)
+        await message.answer("🔧 Group Actions", reply_markup=actions_inline)
         return
     
-    # User has groups - show reply keyboard and auto-select first group
+    # User has groups - show reply keyboard and auto-select default group (or first group)
     logger.info(f"📚 User {user_id} has {len(user_groups)} groups")
     
-    first_group = user_groups[0]
-    first_group_id = first_group.group_id
+    # Since groups are sorted, default group is first (if it exists)
+    # Otherwise, use the first group in the list
+    first_group_id = user_groups[0].group_id if user_groups else None
+    
+    if first_group_id is None:
+        # This shouldn't happen if user_groups is not empty, but handle it
+        logger.warning(f"⚠️ No groups found for user {user_id} after sorting")
+        return
     
     # Create reply keyboard with all groups
     keyboard = await get_groups_keyboard(
@@ -132,6 +152,11 @@ async def handle_groups_enhanced(message: Message, state: FSMContext) -> None:
     # Send intro message
     intro_text = _('groups.intro', lang, count=len(user_groups))
     await message.answer(intro_text, parse_mode="HTML", reply_markup=keyboard)
+    
+    # Send inline actions keyboard
+    from luka_bot.keyboards.groups_actions_inline import build_groups_actions_inline_keyboard
+    actions_inline = await build_groups_actions_inline_keyboard(language=lang)
+    await message.answer("🔧 Group Actions", reply_markup=actions_inline)
     
     # Send group divider with inline buttons (Settings/Delete) and reply keyboard
     await send_group_divider(
@@ -315,9 +340,13 @@ async def handle_groups_back(callback: CallbackQuery, state: FSMContext):
         # Get services
         group_service = await get_group_service()
         thread_service = get_thread_service()
+        default_groups_service = get_default_groups_service()
         
         # Get user's groups
         user_groups = await group_service.list_user_groups(user_id, active_only=True)
+        
+        # Sort groups: default group first, then default channel, then rest
+        user_groups = default_groups_service.sort_groups_by_priority(user_groups)
         
         if not user_groups:
             # No groups yet - show message with Default Settings and Refresh buttons
