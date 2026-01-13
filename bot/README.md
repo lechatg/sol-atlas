@@ -17,19 +17,53 @@ Luka Bot is the conversational agent that powers the SOL Atlas ecosystem. It del
 - `AGENTS.md` – contributor guidelines for agents and supporting services.
 
 ## Quick Start
+
+**Step 1: Prepare configuration (minimally: BOT_TOKEN + OPENAI_API_KEY)**
 ```bash
-# Python 3.11+
+cp .env.example .env
+# Edit .env and populate tokens for bot and llm
+```
+
+**Step 2: Choose how to run the bot**
+
+### Option A: Local Python + Docker Services (Recommended for Development)
+Run Redis and Elasticsearch in Docker, bot locally in Python.
+
+**`.env` settings for this option (already set by default in `.env.example`):**
+- `REDIS_HOST=localhost`
+- `ELASTICSEARCH_URL=http://localhost:9200`
+
+```bash
+# Start required services:
+# - Redis: for FSM state storage and conversation history
+# - Elasticsearch: for Knowledge Base indexing and search
+docker compose up -d redis elasticsearch
+
+# Set up Python environment (Python 3.11+)
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # populate tokens and service URLs (minimally: BOT_TOKEN + OPENAI_API_KEY)
-python -m luka_bot          # starts Luka Bot in polling mode
+
+# Start the bot
+python -m luka_bot
 ```
 
-Optional services:
-- `docker compose up -d redis` – Redis for FSM storage (required).
-- `docker compose up -d elasticsearch` – enable KB indexing/search.
-- `docker compose up -d` – bring up the full stack (bot, Redis, monitoring scaffolding).
+### Option B: Full Docker Stack
+Run everything in Docker (bot + Redis + Elasticsearch).
+
+**`.env` settings for this option (update these in your `.env`):**
+- `REDIS_HOST=redis`
+- `ELASTICSEARCH_URL=http://elasticsearch:9200`
+
+```bash
+# Starts all services: bot, Redis (FSM/history), Elasticsearch (Knowledge Base)
+docker compose up -d
+```
+
+**View logs:**
+```bash
+docker compose logs -f bot
+```
 
 ## Use Cases
 

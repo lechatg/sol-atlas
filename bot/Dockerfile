@@ -35,4 +35,4 @@ RUN useradd --create-home --home-dir /home/appuser --shell /bin/bash appuser \
  && chown -R appuser:appuser /usr/src/app
 USER appuser
 
-CMD ["python", "./luka_bot/__main__.py"]
+CMD ["python", "-m", "luka_bot"]
