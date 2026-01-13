@@ -258,9 +258,11 @@ async def handle_task_file_upload(
         )
         
         # Complete task with file URL (stored in Camunda variable)
+        from luka_bot.services.user_session_cache import get_flow_api_uuid
         camunda_service = get_camunda_service()
+        flow_api_uuid = await get_flow_api_uuid(user_id)
         await camunda_service.complete_task(
-            telegram_user_id=user_id,
+            user_id=flow_api_uuid,
             task_id=task_id,
             variables={s3_variable_name: file_url}
         )

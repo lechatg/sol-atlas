@@ -65,12 +65,12 @@ class ModerationService:
             }
             
             # DEBUG: Log key settings being loaded
-            logger.debug(f"📖 Loading from {key}: AI={decoded_data.get('ai_assistant_enabled')}, Silent={decoded_data.get('silent_mode')}, KB={decoded_data.get('kb_indexation_enabled')}, Moderation={decoded_data.get('moderation_enabled')}")
+            logger.debug(f"📖 Loading from {key}: AI={decoded_data.get('ai_assistant_enabled')}, RespondToAll={decoded_data.get('respond_to_all_messages')}, Silent={decoded_data.get('silent_mode')}, KB={decoded_data.get('kb_indexation_enabled')}, Moderation={decoded_data.get('moderation_enabled')}")
             
             settings = GroupSettings.from_dict(decoded_data)
             
             # DEBUG: Log parsed settings
-            logger.debug(f"✅ Parsed settings: AI={settings.ai_assistant_enabled}, Silent={settings.silent_mode}, KB={settings.kb_indexation_enabled}, Moderation={settings.moderation_enabled}")
+            logger.debug(f"✅ Parsed settings: AI={settings.ai_assistant_enabled}, RespondToAll={settings.respond_to_all_messages}, Silent={settings.silent_mode}, KB={settings.kb_indexation_enabled}, Moderation={settings.moderation_enabled}")
             
             return settings
             
@@ -290,6 +290,7 @@ class ModerationService:
             # Copy bot behavior settings from template
             silent_mode=user_defaults.silent_mode,
             ai_assistant_enabled=user_defaults.ai_assistant_enabled,
+            respond_to_all_messages=user_defaults.respond_to_all_messages,
             kb_indexation_enabled=user_defaults.kb_indexation_enabled,
             language=user_defaults.language,  # Copy default language
             

@@ -101,11 +101,13 @@ async def handle_process_settings(callback: CallbackQuery, state: FSMContext):
         
         # Get user ID to access Camunda
         user_id = callback.from_user.id
-        
+
         # Fetch process instance details
         from luka_bot.services.camunda_service import get_camunda_service
+        from luka_bot.services.user_session_cache import get_flow_api_uuid
         camunda_service = get_camunda_service()
-        client = await camunda_service._get_client(user_id)
+        flow_api_uuid = await get_flow_api_uuid(user_id)
+        client = await camunda_service._get_client(flow_api_uuid)
         
         process_instance = await client.get_process_instance(
             process_instance_id
@@ -298,13 +300,15 @@ async def _toggle_suspension(
         if not is_active:
             await callback.answer("❌ Cannot modify completed process", show_alert=True)
             return
-        
+
         # Update suspension state
         from luka_bot.services.camunda_service import get_camunda_service
+        from luka_bot.services.user_session_cache import get_flow_api_uuid
         camunda_service = get_camunda_service()
         user_id = callback.from_user.id
-        client = await camunda_service._get_client(user_id)
-        
+        flow_api_uuid = await get_flow_api_uuid(user_id)
+        client = await camunda_service._get_client(flow_api_uuid)
+
         await client.update_suspension_state_by_id(
             process_instance_id,
             suspended
@@ -372,13 +376,15 @@ async def handle_process_delete(callback: CallbackQuery, state: FSMContext):
         if not is_active:
             await callback.answer("❌ Cannot delete completed process", show_alert=True)
             return
-        
+
         # Delete process
         from luka_bot.services.camunda_service import get_camunda_service
+        from luka_bot.services.user_session_cache import get_flow_api_uuid
         camunda_service = get_camunda_service()
         user_id = callback.from_user.id
-        client = await camunda_service._get_client(user_id)
-        
+        flow_api_uuid = await get_flow_api_uuid(user_id)
+        client = await camunda_service._get_client(flow_api_uuid)
+
         await client.delete_process(process_instance_id)
         
         await callback.message.edit_text(
@@ -453,12 +459,14 @@ async def handle_process_restart(callback: CallbackQuery, state: FSMContext):
         if not is_active:
             await callback.answer("❌ Cannot restart completed process", show_alert=True)
             return
-        
+
         from luka_bot.services.camunda_service import get_camunda_service
+        from luka_bot.services.user_session_cache import get_flow_api_uuid
         camunda_service = get_camunda_service()
         user_id = callback.from_user.id
-        client = await camunda_service._get_client(user_id)
-        
+        flow_api_uuid = await get_flow_api_uuid(user_id)
+        client = await camunda_service._get_client(flow_api_uuid)
+
         # Get process instance details before deleting
         process_instance = await client.get_process_instance(
             process_instance_id
@@ -482,10 +490,10 @@ async def handle_process_restart(callback: CallbackQuery, state: FSMContext):
         
         # Delete old process
         await client.delete_process(process_instance_id)
-        
+
         # Start new process
         new_process = await camunda_service.start_process(
-            telegram_user_id=user_id,
+            user_id=flow_api_uuid,
             process_key=process_key,
             business_key=business_key,
             variables=variables

@@ -848,12 +848,12 @@ class LukaElasticsearchService:
                     "aggs": {
                         "unique_users": {
                             "cardinality": {
-                                "field": "user_id.keyword"
+                                "field": "user_id"
                             }
                         },
                         "top_users": {
                             "terms": {
-                                "field": "user_id.keyword",
+                                "field": "user_id",
                                 "size": 10,
                                 "order": {"_count": "desc"}
                             },
@@ -1127,12 +1127,12 @@ Language: Respond in {lang_instruction}."""
             
             # Basic: Always include these
             aggs["unique_users"] = {
-                "cardinality": {"field": "user_id.keyword"}
+                "cardinality": {"field": "user_id"}
             }
 
             aggs["top_users"] = {
                 "terms": {
-                    "field": "user_id.keyword",
+                    "field": "user_id",
                     "size": top_n,
                     "order": {"_count": "desc"}
                 },
@@ -1194,7 +1194,7 @@ Language: Respond in {lang_instruction}."""
             if include_user_engagement:
                 aggs["user_message_distribution"] = {
                     "terms": {
-                        "field": "user_id.keyword",
+                        "field": "user_id",
                         "size": 1000  # Large enough to get all users
                     }
                 }
@@ -1312,7 +1312,27 @@ Language: Respond in {lang_instruction}."""
                 "top_users": [],
                 "error": str(e)
             }
-    
+
+    async def index_exists(self, index_name: str) -> bool:
+        """
+        Check if an Elasticsearch index exists.
+
+        Args:
+            index_name: Name of the index to check
+
+        Returns:
+            True if index exists, False otherwise
+        """
+        try:
+            if not self.client:
+                logger.warning("⚠️  Elasticsearch client not initialized")
+                return False
+            exists = await self.client.indices.exists(index=index_name)
+            return exists
+        except Exception as e:
+            logger.warning(f"⚠️  Error checking index existence for {index_name}: {e}")
+            return False
+
     async def delete_index(self, index_name: str) -> bool:
         """
         Delete an index and all its documents.
@@ -1368,7 +1388,7 @@ Language: Respond in {lang_instruction}."""
                     "aggs": {
                         "unique_users": {
                             "terms": {
-                                "field": "user_id.keyword",
+                                "field": "user_id",
                                 "size": 10000  # Max users per group
                             }
                         }

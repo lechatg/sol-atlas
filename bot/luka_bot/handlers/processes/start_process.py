@@ -72,7 +72,7 @@ async def handle_start_history_import(callback: CallbackQuery, state: FSMContext
     
     # Check for existing running process with this business key
     existing_process = await camunda_service.get_process_instance_by_business_key(
-        telegram_user_id=user_id,
+        user_id=str(user_id),
         business_key=business_key,
         active_only=True
     )
@@ -213,9 +213,13 @@ async def _start_process_immediately(
         initial_variables: Optional dict of initial process variables to inject
     """
     try:
+        # Get Flow API UUID for CamundaService
+        from luka_bot.services.user_session_cache import get_flow_api_uuid
+        flow_api_uuid = await get_flow_api_uuid(user_id)
+
         # Start process with initial variables (if any)
         process_instance = await camunda_service.start_process(
-            telegram_user_id=user_id,
+            user_id=flow_api_uuid,
             process_key=process_key,
             business_key=business_key,
             variables=initial_variables or {}
@@ -275,10 +279,14 @@ async def poll_and_render_next_task(
     logger.info(f"🔄 Polling for tasks (fallback mode) - process {process_id}, user {user_id}")
     camunda_service = get_camunda_service()
     task_service = get_task_service()
-    
+
+    # Resolve Flow API UUID for CamundaService calls
+    from luka_bot.services.user_session_cache import get_flow_api_uuid
+    flow_api_uuid = await get_flow_api_uuid(user_id)
+
     try:
         # Get user's tasks
-        tasks = await camunda_service.get_user_tasks(user_id)
+        tasks = await camunda_service.get_user_tasks(flow_api_uuid)
         
         # Filter by process (convert UUID to string for comparison)
         process_tasks = [t for t in tasks if str(t.process_instance_id) == str(process_id)]

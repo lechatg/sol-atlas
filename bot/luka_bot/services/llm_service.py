@@ -1,26 +1,51 @@
 """
-LLM Service - Agent-based with pydantic-ai support.
+⚠️ DEPRECATED: This LLM Service is being replaced by LangGraph ⚠️
 
+**Migration Status**: ✅ COMPLETE - All handlers migrated to LangGraph
+**Replacement**: Use `luka_bot.lg_lukabot.integration.stream_langgraph_agent` instead
+
+**What Changed:**
+- ✅ Direct messages (DM) → Migrated to LangGraph
+- ✅ Group mentions/replies → Migrated to LangGraph
+- ✅ Group-aware DM (via /groups) → Migrated to LangGraph
+- ✅ Voice messages → Migrated to LangGraph
+- ✅ Forwarded messages → Migrated to LangGraph
+
+**Why LangGraph:**
+- Unified architecture across web and Telegram
+- Better tool management and execution
+- Built-in conversation memory (Redis checkpoints)
+- Workflow integration with conversation suggestions
+- More flexible and maintainable
+
+**For New Development:**
+Use `stream_langgraph_agent()` from `luka_bot.lg_lukabot.integration` instead of this service.
+
+**Legacy Use:**
+This service is retained ONLY for internal Redis history methods (_get_history, _clear_history).
+
+---
+
+OLD DOCUMENTATION:
+LLM Service - Agent-based with pydantic-ai support.
 Phase 4: Integrated with pydantic-ai agents for tool support.
 Phase 4: i18n support - language injection into system prompts.
 Phase 4: Support tools enabled (KB, YouTube in Phase 4+).
-
 Replaces direct Ollama calls with agent factory pattern.
 """
 import asyncio
-from typing import AsyncIterator, List, Dict, Any, Optional, TYPE_CHECKING
+from typing import AsyncIterator, List, Dict, Optional, TYPE_CHECKING
 from loguru import logger
 import re
 
 from luka_bot.core.config import settings
 from luka_bot.core.loader import redis_client
-from luka_bot.utils.i18n_helper import get_user_language
+from luka_bot.services.thread_service import get_thread_service
 from luka_bot.agents import (
     ConversationContext,
     create_static_agent_with_basic_tools,
 )
 from luka_bot.agents import youtube_tools  # heuristic fallback for YouTube
-from luka_bot.agents.tools import knowledge_base_tools as kb_tools
 
 if TYPE_CHECKING:
     from luka_bot.models.thread import Thread
@@ -94,7 +119,8 @@ class LLMService:
         thread_id: Optional[str] = None,
         thread: Optional["Thread"] = None,
         system_prompt: Optional[str] = None,
-        save_history: bool = True
+        save_history: bool = True,
+        output_format: str = "telegram"  # "telegram" or "markdown" (for web)
     ) -> AsyncIterator[str]:
         """
         Stream LLM response using pydantic-ai agent.
@@ -178,9 +204,94 @@ class LLMService:
             # Log if conversation summary is injected
             if thread and thread.conversation_summary:
                 logger.debug(f"📝 Injected conversation summary into context: {len(thread.conversation_summary)} chars")
-            
-            # Store user language in context metadata for tools
+
+            # Store user language, output format, and message in context metadata for tools
             ctx.metadata['language'] = user_lang
+            ctx.metadata['output_format'] = output_format  # "telegram" or "markdown"
+            ctx.metadata['user_message'] = user_message  # For digest detection in KB tools
+            
+            # Add source detection: markdown = web, telegram = telegram bot
+            if output_format == "markdown":
+                ctx.metadata['source'] = 'web'
+            else:
+                ctx.metadata['source'] = 'telegram'
+            
+            # Add bot name and URLs for workflow tools
+            # For web users (markdown output), add web app URL
+            # For telegram users, we'd need bot username (would be added elsewhere)
+            ctx.metadata['bot_name'] = settings.LUKA_NAME
+            
+            # Add web app URL for web users (can be used by workflows to invite users)
+            if output_format == "markdown":
+                from luka_bot.core.config import settings as luka_config
+                # Try to get web app URL from AG_UI settings if available
+                try:
+                    from ag_ui_gateway.config.settings import settings as ag_settings
+                    ctx.metadata['web_app_url'] = getattr(ag_settings, 'AG_UI_DOJO_URL', 'http://localhost:3000')
+                except ImportError:
+                    ctx.metadata['web_app_url'] = 'http://localhost:3000'  # Default fallback
+                
+                # Default bot username fallback (can be overridden by actual bot instance)
+                ctx.metadata['bot_username'] = getattr(luka_config, 'BOT_USERNAME', 'SOLAtlasBOT')
+            
+            # Check for active workflow and inject workflow context into metadata
+            try:
+                from luka_bot.services.workflow_service import get_workflow_service
+                workflow_service = get_workflow_service()
+                
+                # Check for any active workflow for this user (check multiple domains)
+                active_workflow = await workflow_service.get_active_workflow_for_user(user_id, "sol_atlas_onboarding")
+                if not active_workflow:
+                    # Check trip planner workflow
+                    active_workflow = await workflow_service.get_active_workflow_for_user(user_id, "trip_planner_onboarding")
+                
+                if active_workflow:
+                    # Inject workflow context into metadata so tools/LLM can access it
+                    ctx.metadata['active_workflow'] = {
+                        'workflow_id': active_workflow.workflow_id,
+                        'domain': active_workflow.domain,
+                        'current_step': active_workflow.current_step,
+                        'progress': active_workflow.progress,
+                        'state': active_workflow.state
+                    }
+                    logger.debug(f"🔗 Active workflow found for user {user_id}: {active_workflow.workflow_id}, step: {active_workflow.current_step}")
+
+                    # Check if user wants to resume a paused workflow
+                    if active_workflow.state == "paused":
+                        user_msg_lower = user_message.lower().strip()
+                        resume_indicators = ["yes", "yeah", "yep", "continue", "resume", "да", "продолжи", "продолжить", "давай"]
+
+                        if any(indicator in user_msg_lower for indicator in resume_indicators):
+                            logger.info(f"▶️ User chose to resume workflow {active_workflow.workflow_id}")
+                            await workflow_service.resume_workflow(active_workflow.workflow_id)
+                            # Refresh workflow state
+                            active_workflow = await workflow_service.get_active_workflow_for_user(user_id, active_workflow.domain)
+                            if active_workflow:
+                                ctx.metadata['active_workflow']['state'] = 'running'
+                                logger.info(f"✅ Workflow resumed successfully")
+
+                    # Check if user is interrupting workflow with off-topic question
+                    if active_workflow.state == "running":
+                        is_off_topic = await self._detect_workflow_interruption(
+                            user_message=user_message,
+                            workflow_domain=active_workflow.domain,
+                            current_step=active_workflow.current_step,
+                            user_id=user_id
+                        )
+
+                        if is_off_topic:
+                            logger.info(f"⏸️ Detected off-topic question during workflow - pausing {active_workflow.workflow_id}")
+                            await workflow_service.pause_workflow(active_workflow.workflow_id)
+
+                            # Update metadata to reflect paused state
+                            ctx.metadata['workflow_paused'] = True
+                            ctx.metadata['paused_workflow_id'] = active_workflow.workflow_id
+                            ctx.metadata['paused_workflow_domain'] = active_workflow.domain
+                            ctx.metadata['paused_step'] = active_workflow.current_step
+                            ctx.metadata['active_workflow']['state'] = 'paused'
+            except Exception as e:
+                # Don't break chat if workflow check fails
+                logger.debug(f"⚠️  Workflow context check failed: {e}")
             
             # Heuristic fallback: If message contains a YouTube URL, call transcript tool directly
             try:
@@ -217,23 +328,31 @@ class LLMService:
             
             logger.info(f"🤖 Creating agent for user {user_id}, thread {thread_id}")
             
-            # Create agent (Phase 4: static agent with support tools)
-            # Phase 5: Will use create_agent_with_user_tasks for Camunda integration
+            # FIX: Load conversation history BEFORE creating agent (so we can check if user already answered)
             try:
-                logger.debug("📦 Step 1: Creating agent via create_static_agent_with_basic_tools()")
-                agent = await create_static_agent_with_basic_tools(user_id)
-                logger.debug(f"✅ Agent created successfully: type={type(agent).__name__}")
-            except Exception as agent_error:
-                logger.error(f"❌ FATAL: Agent creation failed: {agent_error}", exc_info=True)
-                raise
-            
-            # FIX 1: Load conversation history BEFORE streaming
-            try:
-                logger.debug("📦 Step 2: Loading conversation history...")
+                logger.debug("📦 Step 1: Loading conversation history...")
                 history = await self._get_history(user_id, thread_id, max_messages=10)
                 logger.debug(f"✅ History loaded: {len(history)} messages")
             except Exception as history_error:
                 logger.error(f"❌ FATAL: History loading failed: {history_error}", exc_info=True)
+                raise
+
+            # Note: Removed heuristic-based workflow advancement.
+            # Workflows are now advanced naturally by the LLM after processing the user's response.
+            # The LLM context includes workflow step instructions and will handle responses appropriately.
+
+            # Create agent (Phase 4: static agent with support tools)
+            # Phase 5: Will use create_agent_with_user_tasks for Camunda integration
+            try:
+                logger.debug("📦 Step 2: Creating agent via create_static_agent_with_basic_tools()")
+                # Pass enabled_tools to filter tools at registration time
+                agent = await create_static_agent_with_basic_tools(
+                    user_id=user_id,
+                    enabled_tools=effective_enabled_tools
+                )
+                logger.debug(f"✅ Agent created successfully: type={type(agent).__name__}")
+            except Exception as agent_error:
+                logger.error(f"❌ FATAL: Agent creation failed: {agent_error}", exc_info=True)
                 raise
             
             # Convert to pydantic-ai message format
@@ -330,9 +449,10 @@ class LLMService:
                 message_history=model_messages  # Add history to agent context
             ) as stream:
                 logger.debug(f"✅ run_stream context entered, starting execution...")
-                
+
                 # Initialize variables for both streaming and non-streaming modes
                 tool_notification_shown = False
+                is_cumulative_streaming = True  # Default to cumulative mode
                 
                 if settings.STREAMING_ENABLED:
                     # STREAMING ENABLED: Try streaming first
@@ -455,18 +575,39 @@ class LLMService:
                         logger.debug("✅ Streaming produced content, skipping get_output() to avoid duplicate tool execution")
                         # Don't call get_output() - we have a complete response from streaming
                     else:
-                        # Streaming produced no content - fallback to get_output()
-                        logger.info("⚠️ Streaming produced no content, falling back to get_output()")
-                        try:
-                            final_output = await stream.get_output()
-                            if final_output:
-                                full_response = str(final_output)
-                                logger.info(f"✅ get_output() fallback successful: {len(full_response)} chars")
-                                yield full_response
-                            else:
-                                logger.warning("⚠️ get_output() also returned empty")
-                        except Exception as e:
-                            logger.error(f"❌ get_output() fallback failed: {e}")
+                        # Streaming produced no content - check if tools were called first
+                        # If tools were called, we'll extract results manually to avoid re-execution
+                        logger.info("⚠️ Streaming produced no content, checking for tool calls...")
+                        
+                        # Quick check if any tools were called (before calling get_output which might re-execute)
+                        all_msgs_preview = stream.all_messages()
+                        tool_was_called_preview = False
+                        for msg in all_msgs_preview:
+                            if msg.kind == 'response':
+                                for part in msg.parts:
+                                    if part.__class__.__name__ == 'ToolCallPart':
+                                        tool_was_called_preview = True
+                                        break
+                                if tool_was_called_preview:
+                                    break
+                        
+                        if tool_was_called_preview:
+                            # Tools were called - don't use get_output() as it might re-execute
+                            # Instead, we'll extract tool results in the continuation logic below
+                            logger.info("🔧 Tools were called - skipping get_output() to avoid re-execution, will extract results manually")
+                        else:
+                            # No tools called - safe to use get_output()
+                            logger.info("⚠️ No tools called, falling back to get_output()")
+                            try:
+                                final_output = await stream.get_output()
+                                if final_output:
+                                    full_response = str(final_output)
+                                    logger.info(f"✅ get_output() fallback successful: {len(full_response)} chars")
+                                    yield full_response
+                                else:
+                                    logger.warning("⚠️ get_output() also returned empty")
+                            except Exception as e:
+                                logger.error(f"❌ get_output() fallback failed: {e}")
                 
                 else:
                     # STREAMING DISABLED: Still need to iterate stream to trigger execution
@@ -530,12 +671,14 @@ class LLMService:
                     
                     # Also check if tool was actually called
                     tool_was_called = False
+                    called_tool_name = None  # Track which tool was called
                     for msg in all_msgs:
                         if msg.kind == 'response':
                             for part in msg.parts:
                                 if part.__class__.__name__ == 'ToolCallPart':
                                     tool_name = getattr(part, 'tool_name', '')
                                     tool_was_called = True
+                                    called_tool_name = tool_name  # Store the tool name
                                     logger.info(f"  ✅ Found ToolCallPart: {tool_name}")
                     
                     if not tool_was_called:
@@ -545,6 +688,7 @@ class LLMService:
                     seen_results = set()
                     kb_empty_result_found = False
                     last_non_kb_tool_result = None
+                    last_non_kb_tool_name = None  # Track which tool produced the result
                     
                     for msg in all_msgs:
                         if msg.kind == 'request':
@@ -574,11 +718,18 @@ class LLMService:
                                             logger.info(f"⚠️  Skipping duplicate KB result: {len(result)} chars")
                                     elif result:
                                         # Track last non-KB tool output (e.g., workflow execution) for fallback
-                                        last_non_kb_tool_result = result
-                                        logger.info(
-                                            "🧩 Captured tool result for fallback: "
-                                            f"{tool_name or 'unknown'} ({len(result)} chars)"
-                                        )
+                                        # Don't overwrite if we already have a result and the new one is a workflow instruction marker
+                                        if last_non_kb_tool_result and "[WORKFLOW_INSTRUCTION]" in result:
+                                            logger.debug(
+                                                f"⏭️  Skipping workflow instruction update - keeping first result ({len(last_non_kb_tool_result)} chars)"
+                                            )
+                                        else:
+                                            last_non_kb_tool_result = result
+                                            last_non_kb_tool_name = tool_name  # Track which tool produced this result
+                                            logger.info(
+                                                "🧩 Captured tool result for fallback: "
+                                                f"{tool_name or 'unknown'} ({len(result)} chars)"
+                                            )
                     
                     # Handle empty KB result - provide helpful default response
                     if kb_empty_result_found and not kb_tool_results and not full_response:
@@ -687,11 +838,142 @@ Generate ONLY the summary text (no formatting, no extra text)."""
                     else:
                         logger.info("📚 No KB snippets found in tool results")
 
-                    # If LLM produced no text but a tool returned rich output, use it as response
-                    if (not full_response or not full_response.strip()) and last_non_kb_tool_result:
-                        logger.info("🧩 Using tool result as primary response fallback")
-                        yield last_non_kb_tool_result
-                        full_response = last_non_kb_tool_result
+                    # If LLM produced no text but a tool returned rich output, force continuation
+                    # This handles cases where Ollama calls tools but doesn't generate follow-up text
+                    if (not full_response or not full_response.strip()) and last_non_kb_tool_result and tool_was_called:
+                        # Filter out empty or instruction-only messages (e.g., "Workflow is already active...")
+                        tool_result_trimmed = last_non_kb_tool_result.strip()
+                        
+                        # For workflow tool results that are questions (new workflow start), extract the actual question
+                        # Format: "What's your name?" -> extract to What's your name?
+                        is_workflow_question = False
+                        workflow_question_content = None
+                        if '"' in tool_result_trimmed and tool_result_trimmed.count('"') >= 2:
+                            # Check if it's a simple quoted question (new workflow start)
+                            quoted_match = re.match(r'^"([^"]+)"$', tool_result_trimmed)
+                            if quoted_match:
+                                workflow_question_content = quoted_match.group(1)
+                                is_workflow_question = True
+                                logger.debug(f"📝 Extracted workflow question from quotes: {workflow_question_content}")
+                        
+                        should_skip = (
+                            not tool_result_trimmed or
+                            "Do not display this message to the user" in tool_result_trimmed or
+                            "Workflow is already active" in tool_result_trimmed or
+                            (  # Filter workflow step instructions that have the marker
+                                "[WORKFLOW_INSTRUCTION]" in tool_result_trimmed and 
+                                "Ask the user:" in tool_result_trimmed  # Only skip if it's explicitly an instruction template
+                            )
+                        )
+                        
+                        if not should_skip:
+                            # If it's a workflow question, use the extracted content (without quotes)
+                            if is_workflow_question and workflow_question_content:
+                                logger.info(f"🧩 Using workflow question as response: {workflow_question_content}")
+                                yield workflow_question_content
+                                full_response = workflow_question_content
+                            else:
+                                # FORCE CONTINUATION: LLM called tool but didn't generate text
+                                # Create a continuation prompt that includes the tool result
+                                logger.info(f"🔄 Forcing LLM continuation after tool call: {last_non_kb_tool_name or 'unknown'}")
+                                
+                                try:
+                                    # Get user language
+                                    user_lang = "en"
+                                    if thread and hasattr(thread, 'language'):
+                                        user_lang = thread.language
+                                    
+                                    # Create continuation prompt based on tool type
+                                    tool_name = last_non_kb_tool_name or called_tool_name or 'tool'
+                                    
+                                    # Truncate tool result if too long (keep first 2000 chars for context)
+                                    tool_result_preview = tool_result_trimmed[:2000]
+                                    if len(tool_result_trimmed) > 2000:
+                                        tool_result_preview += f"\n\n[... {len(tool_result_trimmed) - 2000} more characters ...]"
+                                    
+                                    if tool_name == 'plan_trip':
+                                        continuation_prompt = f"""The user asked about planning a trip. The trip planning tool returned the following results:
+
+                                            {tool_result_preview}
+                                            
+                                            Now provide a natural, conversational response to the user that:
+                                            1. Acknowledges their trip planning request
+                                            2. Highlights the key information from the trip plan (route, stops, duration)
+                                            3. Is enthusiastic and helpful
+                                            4. Presents the trip plan in a friendly, engaging way
+                                            
+                                            Write your response now:"""
+                                    elif tool_name in ('search_locations', 'find_nearby_locations', 'get_location_details'):
+                                        continuation_prompt = f"""The user asked about locations. The location search tool returned:
+
+                                            {tool_result_preview}
+                                            
+                                            Provide a helpful response that summarizes the key locations found and presents them naturally to the user."""
+                                    elif tool_name == 'suggest_route_stops':
+                                        continuation_prompt = f"""The user asked for route suggestions. The route planning tool returned:
+
+                                            {tool_result_preview}
+                                            
+                                            Provide a helpful response that presents these route suggestions in an engaging way."""
+                                    else:
+                                        # Generic continuation for other tools
+                                        continuation_prompt = f"""A tool was called and returned the following results:
+
+                                            {tool_result_preview}
+                                            
+                                            The user's original question was: "{user_message}"
+                                            
+                                            Now provide a natural, helpful response that incorporates this tool result and answers the user's question. Be conversational and engaging."""
+                                    
+                                    # Create a simple continuation agent (no tools, just text generation)
+                                    from pydantic_ai import Agent
+                                    from luka_bot.services.llm_model_factory import create_llm_model_with_fallback
+                                    
+                                    continuation_model = await create_llm_model_with_fallback(
+                                        context=f"continuation_{user_id}",
+                                        model_settings=None  # Use default settings
+                                    )
+                                    
+                                    continuation_agent = Agent(
+                                        model=continuation_model,
+                                        system_prompt=f"You are a helpful assistant. Process tool results and provide natural, conversational responses to users. Always respond in {user_lang}.",
+                                        retries=0
+                                    )
+                                    
+                                    # Generate continuation response
+                                    logger.info(f"🤖 Generating continuation response for tool: {tool_name}")
+                                    continuation_result = await continuation_agent.run(continuation_prompt)
+                                    continuation_text = continuation_result.output.strip() if hasattr(continuation_result, 'output') else str(continuation_result).strip()
+                                    
+                                    if continuation_text and len(continuation_text) >= 20:
+                                        # Successfully generated continuation
+                                        logger.info(f"✅ Generated continuation response: {len(continuation_text)} chars")
+                                        yield continuation_text
+                                        full_response = continuation_text
+                                        
+                                        # Append the full tool result after the continuation text
+                                        if not continuation_text.endswith('\n\n'):
+                                            yield '\n\n'
+                                            full_response += '\n\n'
+                                        yield last_non_kb_tool_result
+                                        full_response += last_non_kb_tool_result
+                                    else:
+                                        # Continuation failed or too short, fall back to direct tool result
+                                        logger.warning(f"⚠️ Continuation response too short ({len(continuation_text) if continuation_text else 0} chars), using tool result directly")
+                                        yield last_non_kb_tool_result
+                                        full_response = last_non_kb_tool_result
+                                        
+                                except Exception as continuation_err:
+                                    logger.error(f"❌ Continuation generation failed: {continuation_err}", exc_info=True)
+                                    # Fall back to direct tool result
+                                    logger.info("🧩 Falling back to tool result as primary response")
+                                    yield last_non_kb_tool_result
+                                    full_response = last_non_kb_tool_result
+                        else:
+                            logger.debug("⚠️ Skipping tool result - appears to be instruction-only message")
+                            # If we skipped a workflow instruction, log what it contained for debugging
+                            if "[WORKFLOW_INSTRUCTION]" in tool_result_trimmed:
+                                logger.debug(f"   Skipped workflow instruction: {tool_result_trimmed[:100]}")
                 else:
                     logger.info("✅ KB snippets already present in LLM response")
             
@@ -774,7 +1056,7 @@ Generate ONLY the summary text (no formatting, no extra text)."""
                                 if settings.CAMUNDA_ENABLED and settings.CAMUNDA_MESSAGE_CORRELATION_ENABLED:
                                     camunda_task = asyncio.create_task(
                                         camunda_service.correlate_message(
-                                            telegram_user_id=user_id,
+                                            user_id=str(user_id),
                                             message_data=enhanced_assistant_doc,
                                             message_type="ASSISTANT_MESSAGE",
                                             kb_doc_id=kb_doc_id
@@ -840,8 +1122,18 @@ Generate ONLY the summary text (no formatting, no extra text)."""
             if not full_response or not full_response.strip():
                 logger.warning("⚠️  LLM produced NO text output! Retrying once with emphatic prompt...")
                 
-                # Modify prompt to emphasize response requirement
-                retry_message = f"{user_message}\n\n[IMPORTANT: Please provide a direct, helpful response to the user's message above. Do not remain silent.]"
+                # Detect if this is a trip planning request that requires tool usage
+                user_msg_lower = user_message.lower()
+                trip_keywords = ['trip', 'plan', 'itinerary', 'route', 'travel', 'journey', 'from', 'to']
+                is_trip_request = any(keyword in user_msg_lower for keyword in trip_keywords) and ('from' in user_msg_lower or 'to' in user_msg_lower)
+                
+                if is_trip_request:
+                    # Force tool usage for trip planning
+                    retry_message = f"{user_message}\n\n[CRITICAL INSTRUCTION: The user is asking about trip planning. You MUST use the plan_trip tool immediately. Do not try to answer from memory. Call plan_trip with the locations mentioned in the user's message. After calling the tool, present the results to the user.]"
+                    logger.info("🔧 Detected trip planning request - forcing tool usage in retry")
+                else:
+                    # Generic retry for other cases
+                    retry_message = f"{user_message}\n\n[IMPORTANT: Please provide a direct, helpful response to the user's message above. If you need to use tools, use them now. Do not remain silent.]"
                 
                 try:
                     # Re-run the agent with modified prompt
@@ -878,12 +1170,43 @@ Generate ONLY the summary text (no formatting, no extra text)."""
             # SAFETY NET: Ensure we always have a response (after retry)
             if not full_response or not full_response.strip():
                 logger.warning("⚠️  No response generated after retry! Providing fallback message.")
-                fallback_message = "I'm having trouble processing your request right now. Please try again or rephrase your question."
+
+                # Check if we're in a workflow step and can provide a step-specific fallback
+                if active_workflow and active_workflow.current_step == "complete":
+                    # For complete step, extract user name from context or history
+                    user_name = "friend"  # default
+                    if hasattr(active_workflow, 'context') and active_workflow.context.get("user_name"):
+                        user_name = active_workflow.context.get("user_name")
+                    elif history and len(history) > 0:
+                        # Try to extract from last user message
+                        last_user_msg = next((msg for msg in reversed(history) if msg["role"] == "user"), None)
+                        if last_user_msg and last_user_msg.get("content"):
+                            content = last_user_msg.get("content", "").strip()
+                            # Simple heuristic: if it's short and doesn't look like a question, it's probably their name
+                            if len(content) < 50 and "?" not in content:
+                                user_name = content
+
+                    fallback_message = f"Great to meet you, {user_name}! 🎉 Onboarding finished! Now you can explore the options with research."
+                    logger.info(f"✅ Generated workflow-specific fallback for complete step with name: {user_name}")
+                else:
+                    # Generic fallback for non-workflow or other steps
+                    fallback_message = "I'm having trouble processing your request right now. Please try again or rephrase your question."
+
                 yield fallback_message
                 full_response = fallback_message
             
             logger.info(f"✅ Response complete: {len(full_response)} chars")
-            
+
+            # Add resume prompt if workflow was paused
+            if ctx.metadata.get('workflow_paused'):
+                workflow_domain = ctx.metadata.get('paused_workflow_domain', 'workflow')
+                workflow_name = workflow_domain.replace("_", " ").title()
+
+                resume_prompt = f"\n\n_Would you like to continue the **{workflow_name}** where we left off? (Yes/No)_"
+                full_response += resume_prompt
+                yield resume_prompt
+                logger.info(f"💬 Added resume prompt for paused workflow: {workflow_domain}")
+
             # Clear KB search cache after conversation turn completes
             try:
                 from luka_bot.agents.tools.knowledge_base_tools import clear_kb_search_cache
@@ -955,11 +1278,11 @@ Generate ONLY the summary text (no formatting, no extra text)."""
         Returns:
             List of message dicts with role and content
         """
-        # Phase 3: Use thread-scoped history if thread_id provided
+        # Use thread-scoped history if available, otherwise user-scoped
         if thread_id:
             key = f"thread_history:{thread_id}"
         else:
-            key = f"llm_history:{user_id}"  # Fallback to user-scoped (Phase 2 compat)
+            key = f"llm_history:{user_id}"
         
         try:
             # Get last N messages from Redis list
@@ -980,7 +1303,77 @@ Generate ONLY the summary text (no formatting, no extra text)."""
         except Exception as e:
             logger.warning(f"⚠️  Failed to load history: {e}")
             return []
-    
+
+    async def _detect_workflow_interruption(
+        self,
+        user_message: str,
+        workflow_domain: str,
+        current_step: str,
+        user_id: int
+    ) -> bool:
+        """
+        Detect if user's message is off-topic from current workflow step.
+
+        Uses LLM classification to determine if the user is:
+        A) Answering the workflow question
+        B) Asking something completely different (off-topic)
+
+        Args:
+            user_message: User's current message
+            workflow_domain: Domain of the active workflow
+            current_step: Current workflow step ID
+            user_id: User ID for logging
+
+        Returns:
+            True if off-topic (should pause workflow), False otherwise
+        """
+        try:
+            # Get step instruction for context
+            from luka_bot.services.workflow_context_service import get_workflow_context_service
+            context_service = get_workflow_context_service()
+            step_guidance = await context_service.get_workflow_step_guidance(workflow_domain, current_step)
+
+            if not step_guidance:
+                # No guidance available, assume on-topic to be safe
+                logger.debug(f"No step guidance for {workflow_domain}:{current_step}, assuming on-topic")
+                return False
+
+            # Use fast classification with lightweight model
+            classification_prompt = f"""Analyze if the user's response is relevant to the workflow question.
+
+Workflow asks:
+{step_guidance}
+
+User responded: "{user_message}"
+
+Is the response:
+A - Directly answering the workflow question
+B - Asking something completely different or off-topic
+
+Reply with just the letter A or B."""
+
+            # Use fast model for classification (timeout 5s)
+            from luka_bot.services.llm_model_factory import create_llm_model_with_fallback
+            model = await create_llm_model_with_fallback(f"classification_user_{user_id}", timeout=5)
+
+            # Get classification
+            from pydantic_ai import Agent
+            classifier = Agent(model=model)
+
+            result_obj = await classifier.run(classification_prompt)
+            result = str(result_obj.data).strip().upper()
+
+            is_off_topic = "B" in result
+
+            logger.info(f"🤔 Interruption detection: user_message='{user_message[:50]}...', result={result}, off_topic={is_off_topic}")
+
+            return is_off_topic
+
+        except Exception as e:
+            # If classification fails, assume on-topic to avoid falsely pausing workflows
+            logger.warning(f"⚠️  Workflow interruption detection failed: {e}, assuming on-topic")
+            return False
+
     async def _save_to_history(
         self,
         user_id: int,
@@ -1006,11 +1399,11 @@ Generate ONLY the summary text (no formatting, no extra text)."""
             youtube_transcript: Optional full YouTube transcript to store
             youtube_video_title: Optional video title for context
         """
-        # Phase 3: Use thread-scoped history if thread_id provided
+        # Use thread-scoped history if available, otherwise user-scoped
         if thread_id:
             key = f"thread_history:{thread_id}"
         else:
-            key = f"llm_history:{user_id}"  # Fallback to user-scoped
+            key = f"llm_history:{user_id}"
         
         try:
             import json
@@ -1047,9 +1440,73 @@ Generate ONLY the summary text (no formatting, no extra text)."""
             
             # Set expiry (7 days)
             await redis_client.expire(key, 7 * 24 * 60 * 60)
-            
+
+            # Update thread activity and message count
+            if thread_id:
+                try:
+                    thread_service = get_thread_service()
+                    thread = await thread_service.get_thread(thread_id)
+                    if thread:
+                        thread.update_activity()  # Increments message_count
+                        await thread_service.update_thread(thread)
+                        logger.debug(f"📊 Updated thread message count: {thread.message_count}")
+                except Exception as thread_error:
+                    logger.warning(f"⚠️  Failed to update thread message count: {thread_error}")
+
             logger.info(f"💾 Saved conversation turn to history")
             
+            # Check if we should advance workflow to next step
+            try:
+                from luka_bot.services.workflow_service import get_workflow_service
+                workflow_service = get_workflow_service()
+                
+                # Check for active workflow directly using user_id (don't rely on ctx which isn't in scope)
+                active_workflow = await workflow_service.get_active_workflow_for_user(
+                    user_id=user_id,
+                    domain="sol_atlas_onboarding"  # Currently only this workflow is enabled
+                )
+                
+                if active_workflow:
+                    workflow_id = active_workflow.workflow_id
+                    
+                    # Don't advance workflow if message is workflow initiation command
+                    # (e.g., "Please execute the sol_atlas_onboarding workflow")
+                    is_workflow_trigger = (
+                        "execute" in user_message.lower() and "workflow" in user_message.lower()
+                    ) or "sol_atlas_onboarding" in user_message.lower()
+                    
+                    # Skip advancement if we're already on the last step (complete)
+                    # (This prevents double advancement if we advanced before agent creation)
+                    if active_workflow.current_step == "complete":
+                        logger.debug(f"⏸️ Skipping workflow advancement - already on complete step")
+                    # Check if current step received a substantive user response
+                    # (indicates step completion) AND it's not a workflow trigger command
+                    elif user_message and len(user_message.strip()) > 3 and not is_workflow_trigger:
+                        # Prepare context with user_id, thread_id, language for background tasks
+                        advancement_context = {
+                            "user_id": user_id,
+                            "response": user_message
+                        }
+                        if thread_id:
+                            advancement_context["thread_id"] = thread_id
+                        if thread and hasattr(thread, 'language'):
+                            advancement_context["language"] = thread.language
+
+                        # Advance to next step
+                        next_step = await workflow_service.advance_workflow_to_next_step(
+                            workflow_id=workflow_id,
+                            context=advancement_context
+                        )
+                        
+                        if next_step:
+                            logger.info(f"✅ Advanced workflow {workflow_id} to step: {next_step}")
+                        else:
+                            logger.info(f"🎉 Workflow {workflow_id} completed - no more steps")
+                    elif is_workflow_trigger:
+                        logger.debug(f"⏸️ Skipping workflow advancement - message is workflow trigger command")
+            except Exception as e:
+                logger.debug(f"⚠️ Workflow advancement check failed: {e}")
+
         except Exception as e:
             logger.warning(f"⚠️  Failed to save history: {e}")
     
@@ -1108,7 +1565,13 @@ Generate ONLY the summary text (no formatting, no extra text)."""
         language_name = language_names.get(language, "English")
         
         # Inject language into the system prompt
-        prompt = settings.LUKA_DEFAULT_SYSTEM_PROMPT.format(language=language_name)
+        # Use safe formatting to handle prompts with unexpected format specifiers
+        try:
+            prompt = settings.LUKA_DEFAULT_SYSTEM_PROMPT.format(language=language_name)
+        except (KeyError, IndexError, ValueError) as e:
+            # If format fails (e.g., prompt has {0} or other specifiers), use replace
+            logger.warning(f"⚠️ System prompt format failed: {e}, using string replacement")
+            prompt = settings.LUKA_DEFAULT_SYSTEM_PROMPT.replace("{language}", language_name)
         return prompt
 
 

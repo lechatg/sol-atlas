@@ -285,13 +285,35 @@ async def get_cached_user_info(user_id: int) -> Optional[Dict[str, Any]]:
 async def cache_user_info(user_id: int, user_info: Dict[str, Any]):
     """
     Helper to cache user info.
-    
+
     Args:
         user_id: Telegram user ID
         user_info: User info dict
     """
     cache = get_user_session_cache()
     await cache.set_user_info(user_id, user_info)
+
+
+async def get_flow_api_uuid(telegram_user_id: int) -> str:
+    """
+    Get Flow API UUID for a Telegram user.
+
+    This helper is used when calling CamundaService from Telegram bot handlers.
+    CamundaService expects Flow API UUID (string), but Telegram handlers have
+    numeric telegram_user_id.
+
+    Args:
+        telegram_user_id: Telegram user ID (int)
+
+    Returns:
+        Flow API UUID (string) if cached, otherwise telegram_user_id as string fallback
+    """
+    user_info = await get_cached_user_info(telegram_user_id)
+    if user_info and user_info.get("id"):
+        return str(user_info["id"])
+    # Fallback: convert telegram_user_id to string
+    # CamundaService will attempt to look up by this ID in Flow API
+    return str(telegram_user_id)
 
 
 async def get_cached_jwt_token(user_id: int) -> Optional[str]:

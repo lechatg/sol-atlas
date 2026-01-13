@@ -77,10 +77,12 @@ async def handle_start_form_begin(callback: CallbackQuery, state: FSMContext):
             
             # Start process with initial variables (e.g., group_index)
             from luka_bot.services.camunda_service import get_camunda_service
+            from luka_bot.services.user_session_cache import get_flow_api_uuid
             camunda_service = get_camunda_service()
-            
+            flow_api_uuid = await get_flow_api_uuid(telegram_user_id)
+
             process_instance = await camunda_service.start_process(
-                telegram_user_id=telegram_user_id,
+                user_id=flow_api_uuid,
                 process_key=process_key,
                 business_key=business_key,
                 variables=initial_variables
@@ -180,7 +182,7 @@ async def handle_start_form_input(message: Message, state: FSMContext):
             return
         
         # Handle /skip command for default values
-        user_input = message.text.strip()
+        user_input = text.strip()
         if user_input == "/skip":
             # Use default value
             default_value = current_var.get("value", {})
@@ -290,9 +292,13 @@ async def handle_start_form_confirm(callback: CallbackQuery, state: FSMContext):
             variables[var_name] = value
         
         logger.debug(f"🚀 Starting process with {len(variables)} variables: {list(variables.keys())}")
-        
+
+        # Get Flow API UUID for CamundaService
+        from luka_bot.services.user_session_cache import get_flow_api_uuid
+        flow_api_uuid = await get_flow_api_uuid(telegram_user_id)
+
         process_instance = await camunda_service.start_process(
-            telegram_user_id=telegram_user_id,
+            user_id=flow_api_uuid,
             process_key=process_key,
             business_key=business_key,
             variables=variables

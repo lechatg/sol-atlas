@@ -144,18 +144,21 @@ async def create_group_divider(
     group_service = await get_group_service()
     current_language = await group_service.get_group_language(group_id)
     
-    # Get group name from metadata or API
+    # Get group name and username from metadata or API
     group_name = thread.agent_name or 'Group'
+    group_username = None
     try:
         metadata = await group_service.get_cached_group_metadata(group_id)
         if metadata and metadata.group_title:
             group_name = metadata.group_title
+            group_username = metadata.group_username
         elif bot:
             # Fallback to bot API if metadata not available
             try:
                 chat = await bot.get_chat(group_id)
                 if chat and chat.title:
                     group_name = chat.title
+                    group_username = chat.username
             except Exception as api_error:
                 logger.debug(f"Could not get group name from API: {api_error}")
     except Exception as meta_error:
@@ -176,9 +179,26 @@ async def create_group_divider(
     feature_2 = _("groups.divider.feature_2", current_language)
     feature_3 = _("groups.divider.feature_3", current_language)
     
+    # Build join link
+    join_link_section = ""
+    from luka_bot.core.config import settings
+    
+    # For default group/channel, use env variable invite link (simpler and more reliable)
+    if settings.has_default_group and group_id == settings.LUKA_DEFAULT_GROUP_ID:
+        default_invite_link = settings.get_default_group_invite_link()
+        if default_invite_link:
+            join_link_section = f"\n📢 <a href='{default_invite_link}'>Join the group</a>\n"
+    elif settings.has_default_channel and group_id == settings.LUKA_DEFAULT_CHANNEL_ID:
+        default_invite_link = settings.get_default_channel_invite_link()
+        if default_invite_link:
+            join_link_section = f"\n📢 <a href='{default_invite_link}'>Join the channel</a>\n"
+    # For non-default groups, use username if available
+    elif group_username:
+        join_link_section = f"\n📢 <a href='https://t.me/{group_username}'>Join the group</a>\n"
+
     # Build compact, user-friendly overview with prominent group name
     divider = f"""{title}
-━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━{join_link_section}
 {stats_header}
 {members_label}: <b>{stats['member_count']}</b> | {messages_label}: <b>{stats['message_count']:,}</b>
 {activity_label}: <b>{stats['unique_users_week']}</b> {activity_active}, <b>{stats['messages_week']}</b> {activity_messages}

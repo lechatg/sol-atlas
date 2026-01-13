@@ -75,9 +75,8 @@ class ContentRouterService:
 				return None
 
 			elif content.content_type == "forwarded":
-				# Phase 2: Analyze forwarded content
-				logger.info(f"📝 Forwarded content detected (Phase 2): {content.content_url}")
-				return None
+				# Index forwarded content to knowledge base
+				return await self._route_forwarded_content(content, message, user_id, group_id, language)
 
 			else:
 				logger.warning(f"⚠️ Unknown content type: {content.content_type}")
@@ -85,6 +84,147 @@ class ContentRouterService:
 
 		except Exception as e:
 			logger.error(f"❌ Error routing content: {e}", exc_info=True)
+			return None
+
+	async def _route_forwarded_content(
+		self,
+		content: DetectedContent,
+		message: Message,
+		user_id: int,
+		group_id: int,
+		language: str
+	) -> Optional[str]:
+		"""
+		Route forwarded Telegram message content to knowledge base indexing.
+		
+		Extracts the forwarded message text and indexes it with proper metadata.
+		
+		Args:
+			content: Detected forwarded content
+			message: Original Telegram message
+			user_id: User who forwarded the message
+			group_id: Group where message was forwarded
+			language: User's language preference
+			
+		Returns:
+			Analysis result text or None if indexing failed
+		"""
+		try:
+			# Extract forwarded message text
+			forwarded_text = content.raw_text or message.text or message.caption or ""
+			
+			if not forwarded_text:
+				logger.warning(f"⚠️ Forwarded message has no text content to index")
+				return None
+			
+			# Get metadata about the forwarded source
+			metadata = content.metadata or {}
+			forward_source = ""
+			
+			if metadata.get("from_chat_username"):
+				forward_source = f"Channel: @{metadata['from_chat_username']}"
+				if metadata.get("from_chat_title"):
+					forward_source = f"{metadata['from_chat_title']} (@{metadata['from_chat_username']})"
+			elif metadata.get("from_chat_title"):
+				forward_source = f"Channel: {metadata['from_chat_title']}"
+			elif metadata.get("from_user_name"):
+				forward_source = f"User: {metadata['from_user_name']}"
+				if metadata.get("from_user_username"):
+					forward_source = f"{metadata['from_user_name']} (@{metadata['from_user_username']})"
+			
+			# Build attribution text
+			attribution = f"[Forwarded from {forward_source}]"
+			if content.content_url:
+				attribution += f" - {content.content_url}"
+			
+			# Index to knowledge base if KB indexation is enabled
+			from luka_bot.services.moderation_service import get_moderation_service
+			from luka_bot.services.group_service import get_group_service
+			from luka_bot.services.elasticsearch_service import get_elasticsearch_service
+			from luka_bot.utils.document_id_generator import DocumentIDGenerator
+			from datetime import datetime
+			
+			moderation_service = await get_moderation_service()
+			group_settings = await moderation_service.get_group_settings(group_id)
+			
+			# Check if KB indexation is enabled
+			if not group_settings or not group_settings.kb_indexation_enabled:
+				logger.debug(f"⏭️ KB indexation disabled for group {group_id}, skipping forwarded content indexing")
+				return f"📋 Forwarded content detected: {attribution}\n\n{forwarded_text[:200]}..."
+			
+			# Get KB index
+			group_service = await get_group_service()
+			kb_index = await group_service.get_group_kb_index(group_id)
+			
+			if not kb_index:
+				logger.debug(f"⏭️ No KB index for group {group_id}, skipping forwarded content indexing")
+				return f"📋 Forwarded content detected: {attribution}\n\n{forwarded_text[:200]}..."
+			
+			# Generate document ID for forwarded content
+			forwarded_doc_id = DocumentIDGenerator.generate_group_message_id(
+				user_id=user_id,
+				group_id=group_id,
+				telegram_message_id=message.message_id,
+				thread_id=None
+			)
+			# Add suffix to distinguish from regular message
+			forwarded_doc_id = f"{forwarded_doc_id}_forwarded"
+			
+			# Prepare message data with forwarded content
+			sender_name = message.from_user.full_name if message.from_user else "Unknown"
+			group_name = message.chat.title or f"Group {group_id}"
+			
+			# Combine attribution with forwarded text
+			indexed_text = f"{attribution}\n\n{forwarded_text}"
+			
+			forwarded_message_data = {
+				"message_id": forwarded_doc_id,
+				"group_id": str(group_id),
+				"user_id": str(user_id),
+				"group_name": group_name,
+				"role": "user",
+				"thread_id": "",
+				"telegram_topic_id": "",
+				"message_text": indexed_text,  # Include attribution in the text
+				"message_date": message.date.isoformat() if message.date else datetime.utcnow().isoformat(),
+				"sender_name": sender_name,
+				"reply_to_message_id": "",
+				"parent_message_text": None,
+				"parent_message_id": None,
+				"parent_message_user_id": None,
+				"mentions": [],
+				"hashtags": [],
+				"urls": [content.content_url] if content.content_url else [],
+				"media_type": "forwarded",
+				# Additional metadata for forwarded content
+				"forwarded_from": forward_source,
+				"forwarded_url": content.content_url or "",
+				"forward_date": metadata.get("forward_date"),
+				"content_type": "forwarded",
+			}
+			
+			# Index to Elasticsearch
+			try:
+				es_service = await get_elasticsearch_service()
+				index_success = await es_service.index_message_immediate(
+					index_name=kb_index,
+					message_data=forwarded_message_data,
+					document_id=forwarded_doc_id
+				)
+				
+				if index_success:
+					logger.info(f"✅ Indexed forwarded content to {kb_index}: {forwarded_doc_id}")
+					return f"📋 Forwarded content indexed to knowledge base:\n\n{attribution}\n\n{forwarded_text[:300]}..."
+				else:
+					logger.warning(f"⚠️ Failed to index forwarded content: {forwarded_doc_id}")
+					return f"📋 Forwarded content detected (indexing failed): {attribution}\n\n{forwarded_text[:200]}..."
+					
+			except Exception as e:
+				logger.error(f"❌ Error indexing forwarded content: {e}", exc_info=True)
+				return f"📋 Forwarded content detected (error during indexing): {attribution}\n\n{forwarded_text[:200]}..."
+				
+		except Exception as e:
+			logger.error(f"❌ Error routing forwarded content: {e}", exc_info=True)
 			return None
 
 	async def _route_twitter_profile(

@@ -44,6 +44,7 @@ class WorkflowStatus:
         progress: float = 0.0,
         current_step: Optional[str] = None,
         artifacts: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
     ):
         self.workflow_id = workflow_id
@@ -52,6 +53,7 @@ class WorkflowStatus:
         self.progress = progress  # 0.0 to 1.0
         self.current_step = current_step
         self.artifacts = artifacts or {}
+        self.context = context or {}  # Step data passed between workflow steps
         self.error = error
         self.last_updated = datetime.utcnow()
 
@@ -162,12 +164,16 @@ class WorkflowService:
             if domain not in workflows:
                 raise ValueError(f"Workflow domain '{domain}' not found")
 
+            # Set first step from workflow definition
+            steps = workflows[domain].tool_chain.get("steps", [])
+            first_step_id = steps[0].get("id", "initialization") if steps else "initialization"
+            
             workflow_status = WorkflowStatus(
                 workflow_id=workflow_id,
                 domain=domain,
-                state="initialized",
-                progress=0.0,
-                current_step="initialization",
+                state="running",  # Start in running state, not initialized
+                progress=0.1,  # 10% for starting
+                current_step=first_step_id,  # Start at first real step
             )
 
             self._active_workflows[workflow_id] = workflow_status
@@ -178,6 +184,26 @@ class WorkflowService:
             logger.error(f"Failed to start workflow for user {user_id}, domain {domain}: {e}")
             raise
 
+    async def get_active_workflow_for_user(self, user_id: int, domain: str) -> Optional[WorkflowStatus]:
+        """
+        Find active workflow for a user in a specific domain.
+        
+        Returns the most recent active workflow (running or initialized) for the user.
+        """
+        matching_workflows = []
+        for workflow_id, status in self._active_workflows.items():
+            # Extract user_id from workflow_id format: wf_{user_id}_{domain}_{counter}_{timestamp}
+            if workflow_id.startswith(f"wf_{user_id}_{domain}_"):
+                if status.state in ("initialized", "running", "paused"):
+                    matching_workflows.append((workflow_id, status))
+        
+        if not matching_workflows:
+            return None
+        
+        # Return most recent (last updated)
+        matching_workflows.sort(key=lambda x: x[1].last_updated, reverse=True)
+        return matching_workflows[0][1]
+
     async def get_workflow_status(self, workflow_id: str) -> Optional[WorkflowStatus]:
         """Get current workflow progress and artifacts."""
         status = self._active_workflows.get(workflow_id)
@@ -186,13 +212,23 @@ class WorkflowService:
         return status
 
     async def execute_workflow_step(self, workflow_id: str, step_name: str, context: Dict[str, Any]) -> bool:
-        """Execute a single workflow step with context."""
+        """
+        Execute a single workflow step with context.
+
+        Note: This method updates workflow status. The actual step execution
+        (following instructions, using tools, etc.) is done by the LLM agent
+        following the step instructions from the workflow definition.
+        """
         if workflow_id not in self._active_workflows:
             return False
 
         status = self._active_workflows[workflow_id]
         status.current_step = step_name
         status.state = "running"
+
+        # Merge provided context into workflow status context
+        if context:
+            status.context.update(context)
 
         try:
             discovery_service = self._get_discovery_service()
@@ -204,22 +240,120 @@ class WorkflowService:
                 status.error = f"Workflow definition not found for domain {status.domain}"
                 return False
 
-            logger.info(f"Executing workflow step '{step_name}' for workflow {workflow_id}")
+            logger.info(f"Updating workflow step to '{step_name}' for workflow {workflow_id}")
 
-            status.progress = min(status.progress + 0.1, 1.0)
+            # Check if this step has background tasks to launch
+            steps = workflow_def.tool_chain.get("steps", [])
+            current_step_def = next((s for s in steps if s.get("id") == step_name), None)
+
+            if current_step_def:
+                background_tasks = current_step_def.get("background_tasks", [])
+                if background_tasks:
+                    # Launch background tasks for this step
+                    import asyncio
+                    from luka_bot.agents.tools.workflow_tools import _send_crypto_insight_followup, _send_group_stats_followup
+
+                    user_id = context.get("user_id")
+                    thread_id = context.get("thread_id")
+                    language = context.get("language", "en")
+
+                    # Skip if required context is missing
+                    if not user_id or not thread_id:
+                        logger.warning(f"⚠️ Cannot launch background tasks: missing user_id or thread_id")
+                    else:
+                        for task in background_tasks:
+                            task_type = task.get("type")
+                            trigger = task.get("trigger", "on_step_start")
+
+                            if trigger == "on_step_start":
+                                if task_type == "crypto_insight":
+                                    logger.info(f"🚀 Launching crypto insight background task for step {step_name}")
+                                    asyncio.create_task(_send_crypto_insight_followup(user_id, thread_id, language))
+                                elif task_type == "group_stats":
+                                    logger.info(f"🚀 Launching group stats background task for step {step_name}")
+                                    asyncio.create_task(_send_group_stats_followup(user_id, thread_id, language))
+                                else:
+                                    logger.warning(f"⚠️ Unknown background task type: {task_type}")
+
+            # Calculate progress based on step position
+            if steps and step_name != "initialization":
+                # Find current step index
+                step_index = next((i for i, s in enumerate(steps) if s.get("id") == step_name), -1)
+                if step_index >= 0:
+                    # Progress = (step_index + 1) / total_steps, with some buffer for completion
+                    status.progress = min((step_index + 1) / len(steps), 0.95)  # Leave 5% for final completion
+                else:
+                    # Step not found, increment slightly
+                    status.progress = min(status.progress + 0.1, 0.95)
+            else:
+                # Initialization step
+                status.progress = 0.1
+            
             status.last_updated = datetime.utcnow()
 
-            if status.progress >= 1.0:
-                status.state = "completed"
-                logger.info(f"Workflow {workflow_id} completed successfully")
+            # Mark as completed if we've reached the last step (will be finalized when step completes)
+            if status.progress >= 0.95:
+                logger.debug(f"Workflow {workflow_id} nearing completion (progress: {status.progress:.0%})")
 
             return True
 
         except Exception as e:
             status.state = "failed"
             status.error = str(e)
-            logger.error(f"Failed to execute workflow step {step_name} for {workflow_id}: {e}")
+            logger.error(f"Failed to update workflow step {step_name} for {workflow_id}: {e}")
             return False
+    
+    async def advance_workflow_to_next_step(self, workflow_id: str, context: Dict[str, Any]) -> Optional[str]:
+        """
+        Advance workflow to the next step based on current step and workflow definition.
+        
+        Returns:
+            Next step ID if found, None if workflow is complete or has no next step
+        """
+        if workflow_id not in self._active_workflows:
+            return None
+        
+        status = self._active_workflows[workflow_id]
+        
+        try:
+            discovery_service = self._get_discovery_service()
+            workflows = await discovery_service.get_available_workflows()
+            workflow_def = workflows.get(status.domain)
+            
+            if not workflow_def:
+                return None
+            
+            steps = workflow_def.tool_chain.get("steps", [])
+            if not steps:
+                return None
+            
+            # Find current step index
+            current_step_id = status.current_step or "initialization"
+            if current_step_id == "initialization":
+                # First step after initialization
+                next_step = steps[0] if steps else None
+            else:
+                current_index = next((i for i, s in enumerate(steps) if s.get("id") == current_step_id), -1)
+                if current_index < 0 or current_index >= len(steps) - 1:
+                    # Last step or step not found
+                    status.state = "completed"
+                    status.progress = 1.0
+                    logger.info(f"Workflow {workflow_id} completed - no more steps")
+                    return None
+                
+                next_step = steps[current_index + 1]
+            
+            if next_step:
+                next_step_id = next_step.get("id")
+                await self.execute_workflow_step(workflow_id, next_step_id, context)
+                logger.info(f"Advanced workflow {workflow_id} to step: {next_step_id}")
+                return next_step_id
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to advance workflow {workflow_id}: {e}")
+            return None
 
     async def pause_workflow(self, workflow_id: str) -> bool:
         """Pause workflow with state preservation."""

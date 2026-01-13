@@ -11,6 +11,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from luka_bot.services.workflow_discovery_service import WorkflowDiscoveryService
     from luka_bot.services.workflow_context_service import WorkflowContextService
     from luka_bot.services.workflow_definition_service import WorkflowDefinitionService
+    from luka_bot.services.user_profile_service import UserProfileService
 
 
 def get_elasticsearch_service():
@@ -49,6 +50,12 @@ def get_workflow_definition_service():
     return _get()
 
 
+def get_user_profile_service():
+    from luka_bot.services.user_profile_service import get_user_profile_service as _get
+
+    return _get()
+
+
 __all__ = [
     "get_elasticsearch_service",
     "get_message_state_service",
@@ -56,4 +63,5 @@ __all__ = [
     "get_workflow_discovery_service",
     "get_workflow_context_service",
     "get_workflow_definition_service",
+    "get_user_profile_service",
 ]

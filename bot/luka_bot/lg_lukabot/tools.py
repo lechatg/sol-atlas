@@ -2407,7 +2407,7 @@ def map_config_tools_to_langgraph_tools(config_tools: list[str]) -> list[str]:
     # Map of config tool module names to individual LangGraph tool names
     tool_module_map = {
         "knowledge_base": [
-            "search_crypto_tweets",  # NEW: separate tool for crypto tweets
+            # "search_crypto_tweets",  # NEW: separate tool for crypto tweets
             "search_message_history",  # NEW: separate tool for message history
             "list_recent_messages",
             "knowledge_base_stats",

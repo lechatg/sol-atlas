@@ -300,8 +300,10 @@ class DialogService:
                     )
                     
                     # Complete task in Camunda
+                    from luka_bot.services.user_session_cache import get_flow_api_uuid
+                    flow_api_uuid = await get_flow_api_uuid(context.form_data.telegram_user_id)
                     await camunda_service.complete_task(
-                        telegram_user_id=context.form_data.telegram_user_id,
+                        user_id=flow_api_uuid,
                         task_id=context.form_data.task_id,
                         variables=final_collected_values
                     )
@@ -877,8 +879,11 @@ class DialogService:
                 await self._start_process_after_form(message, state, user_id, variables)
             else:
                 # Regular task completion
+                # Get Flow API UUID for CamundaService
+                from luka_bot.services.user_session_cache import get_flow_api_uuid
+                flow_api_uuid = await get_flow_api_uuid(user_id)
                 await self.camunda_service.complete_task(
-                    telegram_user_id=user_id,
+                    user_id=flow_api_uuid,
                     task_id=task_id,
                     variables=variables
                 )
@@ -918,13 +923,17 @@ class DialogService:
         try:
             data = await state.get_data()
             pending_process = data.get("pending_process", {})
-            
+
             # Use only form variables - no automatic merging of initial variables
             # The start form should request all needed variables from the user
-            
+
+            # Get Flow API UUID for CamundaService
+            from luka_bot.services.user_session_cache import get_flow_api_uuid
+            flow_api_uuid = await get_flow_api_uuid(user_id)
+
             # Start the process
             process_instance = await self.camunda_service.start_process(
-                telegram_user_id=user_id,
+                user_id=flow_api_uuid,
                 process_key=pending_process["process_key"],
                 business_key=pending_process["business_key"],
                 variables=form_variables  # Only collected form variables

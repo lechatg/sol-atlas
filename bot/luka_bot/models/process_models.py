@@ -40,5 +40,7 @@ class TaskVariables:
     text_vars: List[Dict[str, Any]] = field(default_factory=list)
     action_vars: List[Dict[str, Any]] = field(default_factory=list)
     form_vars: List[Dict[str, Any]] = field(default_factory=list)
-    s3_vars: List[Dict[str, Any]] = field(default_factory=list)  # NEW
+    s3_vars: List[Dict[str, Any]] = field(default_factory=list)
+    formmultiline_vars: List[Dict[str, Any]] = field(default_factory=list)  # Textarea variables
+    select_vars: List[Dict[str, Any]] = field(default_factory=list)  # Select/dropdown variables
 

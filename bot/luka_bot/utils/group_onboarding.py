@@ -65,7 +65,7 @@ async def send_group_onboarding_to_dm(
         from luka_bot.services.group_service import get_group_service
         from luka_bot.keyboards.groups_menu import get_groups_keyboard, get_empty_groups_keyboard
         
-        group_service = get_group_service()
+        group_service = await get_group_service()
         user_groups = await group_service.list_user_groups(user_id)
         
         # Build groups reply keyboard with the newly added group

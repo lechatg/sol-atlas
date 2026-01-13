@@ -134,7 +134,8 @@ class WorkflowDiscoveryService:
             discovery_tasks = []
             for base_path in self._iter_existing_paths():
                 for domain_dir in base_path.iterdir():
-                    if not domain_dir.is_dir() or domain_dir.name.startswith("."):
+                    # Skip hidden directories, _disabled folder, and non-directories
+                    if not domain_dir.is_dir() or domain_dir.name.startswith(".") or domain_dir.name == "_disabled":
                         continue
 
                     config_path = domain_dir / self.CONFIG_FILENAME
@@ -188,11 +189,18 @@ class WorkflowDiscoveryService:
                     logger.error(
                         f"Workflow {domain} validation failed with {error_count} errors, {warning_count} warnings"
                     )
-                    if logger.level <= 10:
-                        logger.debug(
-                            f"Validation errors for {domain}:\n"
-                            f"{self._validation_service.format_validation_errors(errors)}"
-                        )
+                    # Log validation errors (logger.level is a method in loguru, use _core.min_level)
+                    try:
+                        # In loguru, logger.level is a method, so use _core.min_level to check debug level
+                        log_level = logger._core.min_level if hasattr(logger, '_core') else 20
+                        if log_level <= 10:  # DEBUG level (10)
+                            formatted_errors = self._validation_service.format_validation_errors(errors)
+                            logger.debug(f"Validation errors for {domain}:\n{formatted_errors}")
+                    except (AttributeError, TypeError):
+                        # Fallback: format errors anyway for debugging
+                        formatted_errors = self._validation_service.format_validation_errors(errors)
+                        if formatted_errors:
+                            logger.debug(f"Validation errors for {domain}:\n{formatted_errors}")
                 elif warning_count:
                     logger.warning(f"Workflow {domain} has {warning_count} validation warnings")
 

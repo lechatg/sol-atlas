@@ -280,10 +280,15 @@ class UserProfileService:
         Args:
             user_id: Telegram user ID
             kb_index: Elasticsearch KB index name (e.g., "tg-kb-user-922705")
-            
+
         Returns:
             True if set successfully
         """
+        # Skip profile operations for guest users (they use public KB)
+        if user_id == 0:
+            logger.debug(f"Skipping KB index set for guest user (using public KB)")
+            return True
+
         try:
             profile = await self.get_profile(user_id)
             if not profile:

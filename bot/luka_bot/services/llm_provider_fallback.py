@@ -132,6 +132,16 @@ class LLMProviderFallback:
                 logger.debug(f"   Result: {is_healthy}")
                 
                 if is_healthy:
+                    # Check if we recently validated this provider (within last minute)
+                    # This avoids redundant health checks and reduces latency
+                    last_check = self._last_health_check.get(provider)
+                    now = datetime.utcnow()
+                    skip_health_check = last_check and (now - last_check).total_seconds() < self.HEALTH_CHECK_TTL
+
+                    if skip_health_check:
+                        logger.debug(f"✅ {log_prefix} Using cached provider {provider} (health check < {self.HEALTH_CHECK_TTL}s old, skipping)")
+                        return provider
+
                     # Quick health check before using cached provider
                     logger.debug(f"📦 {log_prefix} Step 1b: Running health check on {provider}...")
                     try:
@@ -141,11 +151,15 @@ class LLMProviderFallback:
                             timeout=5.0  # 5 second max wait
                         )
                         logger.debug(f"   Health check result: {health_check_ok}")
+
+                        # Cache successful health check timestamp
+                        if health_check_ok:
+                            self._last_health_check[provider] = now
                     except asyncio.TimeoutError:
                         logger.warning(f"{log_prefix} ⚠️  Health check timed out after 5s")
                         health_check_ok = False
                         logger.debug(f"   Health check result: {health_check_ok}")
-                    
+
                     if health_check_ok:
                         logger.debug(f"✅ {log_prefix} Using cached provider: {provider}")
                         return provider

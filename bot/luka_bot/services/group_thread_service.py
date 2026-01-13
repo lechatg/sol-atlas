@@ -70,8 +70,20 @@ class GroupThreadService:
         group_thread = await thread_service.get_group_thread(group_id)
         
         if not group_thread:
-            logger.error(f"❌ Group thread not found for group {group_id}")
-            raise ValueError(f"Group {group_id} not found")
+            logger.warning(f"⚠️ Group thread not found for group {group_id}, creating one...")
+            
+            # Try to get group metadata to get the group title
+            group_metadata = await group_service.get_cached_group_metadata(group_id)
+            group_title = group_metadata.title if group_metadata else f"Group {abs(group_id)}"
+            
+            # Create the group thread
+            group_thread = await thread_service.create_group_thread(
+                group_id=group_id,
+                group_title=group_title,
+                owner_id=user_id,  # Use the current user as owner
+                language="en"  # Default to English, can be changed later
+            )
+            logger.info(f"✨ Created group thread for group {group_id}")
         
         # Get group info
         group_name = group_thread.name or f"Group {group_id}"
@@ -150,7 +162,7 @@ class GroupThreadService:
                 es_service = await get_elasticsearch_service()
                 
                 try:
-                    index_stats = await es_service.es.count(index=kb_index)
+                    index_stats = await es_service.client.count(index=kb_index)
                     message_count = index_stats.get('count', 0)
                     logger.debug(f"📊 Indexed message count for {kb_index}: {message_count}")
                 except Exception as e:

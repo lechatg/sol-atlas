@@ -3,8 +3,11 @@ Camunda Engine integration service for luka_bot.
 Manages Camunda connections, process instances, and tasks.
 """
 import asyncio
+import hashlib
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
+from datetime import datetime
+from uuid import UUID
 from loguru import logger
 
 from camunda_client.clients.engine.client import CamundaEngineClient
@@ -22,8 +25,8 @@ import httpx
 
 @dataclass
 class CamundaUserMapping:
-    """Maps Telegram user to Camunda credentials"""
-    telegram_id: int
+    """Maps user (Flow API UUID) to Camunda credentials"""
+    user_id: str  # Flow API UUID
     camunda_user_id: str
     camunda_password: str
 
@@ -38,9 +41,11 @@ class CamundaService:
         self._transport = httpx.AsyncHTTPTransport(
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
         )
-        self._user_mappings: Dict[int, CamundaUserMapping] = {}
+        self._user_mappings: Dict[str, CamundaUserMapping] = {}
         # Cache clients per user to reuse sessions and prevent resource leaks
-        self._clients: Dict[int, CamundaEngineClient] = {}
+        # For web users, use composite key: (telegram_user_id, webapp_user_id, platform)
+        # For telegram users, use just telegram_user_id
+        self._clients: Dict[tuple, CamundaEngineClient] = {}
         
     @classmethod
     def get_instance(cls) -> 'CamundaService':
@@ -50,14 +55,102 @@ class CamundaService:
             logger.info("✅ CamundaService singleton created")
         return cls._instance
     
-    async def _get_client(self, telegram_user_id: int) -> CamundaEngineClient:
-        """Get or create cached Camunda client for user"""
-        # Return cached client if exists
-        if telegram_user_id in self._clients:
-            return self._clients[telegram_user_id]
+    def _get_cache_key(
+        self,
+        user_id: str,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
+    ) -> tuple:
+        """
+        Generate cache key for client.
+        
+        For web users, include webapp_user_id in the key to handle cases where
+        the same user_id maps to different Camunda credentials.
+        For telegram users, just use user_id (Flow API UUID).
+        """
+        if platform == "web" and webapp_user_id:
+            return (user_id, webapp_user_id, platform)
+        else:
+            return (user_id,)
+    
+    async def _get_client(
+        self, 
+        user_id: str,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
+    ) -> CamundaEngineClient:
+        """
+        Get or create cached Camunda client for user.
+        
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform type ("web" or "telegram")
+        
+        Uses composite cache keys for web users to handle different webapp_user_id mappings.
+        Only creates new client if cache key changes or client is closed.
+        """
+        cache_key = self._get_cache_key(user_id, webapp_user_id, platform)
+        
+        logger.debug(
+            f"🔍 _get_client called: user_id={user_id}, "
+            f"webapp_user_id={webapp_user_id}, platform={platform}, "
+            f"cache_key={cache_key}, "
+            f"cached_client_exists={cache_key in self._clients}, "
+            f"mapping_exists={user_id in self._user_mappings}"
+        )
+        
+        # Check if we have a cached client with this key
+        cached_client = self._clients.get(cache_key)
+        if cached_client:
+            # Check if client is still valid (not closed)
+            is_closed = False
+            if hasattr(cached_client, '_http_client') and cached_client._http_client:
+                if hasattr(cached_client._http_client, 'is_closed') and cached_client._http_client.is_closed:
+                    is_closed = True
+            elif hasattr(cached_client, '_session') and cached_client._session:
+                if hasattr(cached_client._session, 'closed') and cached_client._session.closed:
+                    is_closed = True
+            
+            if not is_closed:
+                logger.debug(f"🔧 Using cached Camunda client for cache_key={cache_key}")
+                return cached_client
+            else:
+                # Client is closed, remove from cache and create new one
+                logger.debug(f"🔄 Cached client for {cache_key} is closed, removing from cache")
+                del self._clients[cache_key]
         
         # Get or create user mapping
-        mapping = await self._get_or_create_user_mapping(telegram_user_id)
+        mapping = await self._get_or_create_user_mapping(
+            user_id, 
+            webapp_user_id=webapp_user_id,
+            platform=platform
+        )
+        
+        logger.debug(
+            f"🔍 After _get_or_create_user_mapping: "
+            f"mapping_exists={user_id in self._user_mappings}, "
+            f"mapping_camunda_user_id={mapping.camunda_user_id if mapping else None}, "
+            f"mapping_keys={list(self._user_mappings.keys())}"
+        )
+        
+        if not mapping:
+            raise ValueError(f"Failed to create user mapping for {user_id}")
+        
+        # Validate credentials before creating client
+        if not mapping.camunda_user_id or not mapping.camunda_password:
+            raise ValueError(
+                f"Missing Camunda credentials for user {user_id}: "
+                f"camunda_user_id={mapping.camunda_user_id}, "
+                f"camunda_password={'***' if mapping.camunda_password else None}"
+            )
+        
+        logger.info(
+            f"🔧 Creating Camunda client for user {user_id} "
+            f"(platform={platform}, webapp_user_id={webapp_user_id}) "
+            f"with camunda_user_id={mapping.camunda_user_id} "
+            f"(password length: {len(mapping.camunda_password) if mapping.camunda_password else 0})"
+        )
         
         auth_data = AuthData(
             username=mapping.camunda_user_id,
@@ -70,37 +163,54 @@ class CamundaService:
             auth_data=auth_data,
             transport=self._transport
         )
-        self._clients[telegram_user_id] = client
         
-        logger.debug(f"🔧 Created Camunda client for user {telegram_user_id}")
+        # Note: We don't verify credentials here because:
+        # 1. The /user/{id}/profile endpoint doesn't exist in Camunda Engine REST API
+        # 2. Actual operations will fail with proper errors (401) if credentials are invalid
+        # 3. This avoids unnecessary API calls and log noise
+        
+        # Cache client using composite key
+        self._clients[cache_key] = client
+        
+        logger.debug(f"✅ Created and cached Camunda client for cache_key={cache_key}")
         return client
     
     async def close_all_clients(self):
         """Close all cached clients (call on shutdown)"""
-        for user_id, client in list(self._clients.items()):
+        for cache_key, client in list(self._clients.items()):
             try:
                 await client.close()
-                logger.debug(f"🔒 Closed Camunda client for user {user_id}")
+                logger.debug(f"🔒 Closed Camunda client for cache_key={cache_key}")
             except Exception as e:
-                logger.warning(f"Failed to close client for user {user_id}: {e}")
+                logger.warning(f"Failed to close client for cache_key={cache_key}: {e}")
         self._clients.clear()
     
-    async def _get_or_create_user_mapping(self, telegram_user_id: int) -> CamundaUserMapping:
+    async def _get_or_create_user_mapping(
+        self, 
+        user_id: str,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
+    ) -> CamundaUserMapping:
         """
         Get or create Camunda user mapping.
+        
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform type ("web" or "telegram")
         
         Priority order:
         1. In-memory cache (fastest)
         2. Session cache (fast, from Flow API)
-        3. UserProfile (fallback, persistent storage)
+        3. Flow API lookup (for web users, lookup by webapp_user_id)
         """
         # Check in-memory cache first
-        if telegram_user_id in self._user_mappings:
-            return self._user_mappings[telegram_user_id]
+        if user_id in self._user_mappings:
+            return self._user_mappings[user_id]
         
         # Try session cache (from Flow API auth middleware)
         from luka_bot.services.user_session_cache import get_cached_user_info
-        user_info = await get_cached_user_info(telegram_user_id)
+        user_info = await get_cached_user_info(user_id)
         
         if user_info:
             camunda_user_id = user_info.get("camunda_user_id")
@@ -108,39 +218,20 @@ class CamundaService:
             
             if camunda_user_id and camunda_key:
                 mapping = CamundaUserMapping(
-                    telegram_id=telegram_user_id,
+                    user_id=user_id,
                     camunda_user_id=camunda_user_id,
                     camunda_password=camunda_key
                 )
-                self._user_mappings[telegram_user_id] = mapping
+                self._user_mappings[user_id] = mapping
                 
                 logger.info(
                     f"🔐 Created Camunda mapping from session cache: "
-                    f"Telegram {telegram_user_id} → Camunda {camunda_user_id}"
+                    f"User {user_id} → Camunda {camunda_user_id}"
                 )
                 return mapping
         
-        # Fallback to UserProfile (persistent storage)
-        from luka_bot.services.user_profile_service import get_user_profile_service
-        profile_service = get_user_profile_service()
-        profile = await profile_service.get_user_profile(telegram_user_id)
-        
-        if profile and profile.camunda_user_id and profile.camunda_key:
-            mapping = CamundaUserMapping(
-                telegram_id=telegram_user_id,
-                camunda_user_id=profile.camunda_user_id,
-                camunda_password=profile.camunda_key
-            )
-            self._user_mappings[telegram_user_id] = mapping
-            
-            logger.info(
-                f"🔐 Created Camunda mapping from UserProfile: "
-                f"Telegram {telegram_user_id} → Camunda {profile.camunda_user_id}"
-            )
-            return mapping
-        
-        # Last resort: Fetch directly from Flow API (e.g., for guest user)
-        logger.info(f"🔍 Fetching user {telegram_user_id} from Flow API...")
+        # Last resort: Fetch directly from Flow API
+        logger.info(f"🔍 Fetching user {user_id} from Flow API...")
         try:
             from flow_client.clients.flow.client import FlowClient
             
@@ -148,46 +239,183 @@ class CamundaService:
                 base_url=settings.FLOW_API_URL,
                 sys_key=settings.FLOW_API_SYS_KEY
             ) as flow_client:
-                user_data = await flow_client.get_user(telegram_user_id=telegram_user_id)
+                # Try multiple lookup methods in order of preference
+                user_data = None
                 
+                # Method 1: Try by Flow API UUID (user_id is now the Flow API UUID)
+                try:
+                    user_data = await flow_client.get_user(user_id=user_id)
+                    if user_data:
+                        logger.info(f"✅ Found user in Flow API by user_id (UUID): {user_id}, has_camunda={bool(user_data.camunda_user_id)}")
+                except Exception as e:
+                    logger.debug(f"⚠️ Exception getting user by user_id {user_id}: {e}")
+                    user_data = None
+                
+                # Method 2: For web users, try webapp_user_id if user_id lookup failed
+                if not user_data and platform == "web" and webapp_user_id:
+                    try:
+                        # Ensure webapp_user_id is a valid UUID string format
+                        from uuid import UUID as UUIDType
+                        try:
+                            # Validate UUID format
+                            uuid_obj = UUIDType(webapp_user_id)
+                            user_data = await flow_client.get_user(webapp_id=str(uuid_obj))
+                            if user_data:
+                                logger.info(f"✅ Found user in Flow API by webapp_user_id: {webapp_user_id}, has_camunda={bool(user_data.camunda_user_id)}")
+                        except ValueError as uuid_error:
+                            logger.warning(f"⚠️ webapp_user_id {webapp_user_id} is not a valid UUID format: {uuid_error}")
+                    except Exception as e:
+                        error_str = str(e)
+                        # 422 means invalid UUID format or validation error - log but don't treat as fatal
+                        if "422" in error_str or "Unprocessable" in error_str:
+                            logger.debug(f"⚠️ webapp_user_id {webapp_user_id} rejected by Flow API (422 - validation error)")
+                        else:
+                            logger.warning(f"⚠️ Exception getting user by webapp_user_id {webapp_user_id}: {e}")
+                
+                # If user found but no Camunda credentials, this indicates a Flow API bug
+                # Flow API's create_user endpoint should automatically create Camunda credentials
+                # If they're missing, it means Flow API's error handling failed to delete the user
+                if user_data and not (user_data.camunda_user_id and user_data.camunda_key):
+                    logger.error(
+                        f"❌ User {user_data.id} exists in Flow API but missing Camunda credentials. "
+                        f"camunda_user_id={user_data.camunda_user_id}, camunda_key={'***' if user_data.camunda_key else None}. "
+                        "This indicates Flow API's create_user endpoint failed to create Camunda user and didn't delete the user as expected."
+                    )
+                    raise ValueError(
+                        f"User {user_data.id} exists in Flow API but has no Camunda credentials. "
+                        "Flow API's create_user endpoint should automatically create Camunda credentials. "
+                        "If Camunda creation fails, Flow API should delete the user. "
+                        "Please check Flow API logs and ensure create_camunda_user is working correctly."
+                    )
+                
+                # If user found with credentials, use them
                 if user_data and user_data.camunda_user_id and user_data.camunda_key:
                     mapping = CamundaUserMapping(
-                        telegram_id=telegram_user_id,
+                        user_id=user_id,
                         camunda_user_id=user_data.camunda_user_id,
                         camunda_password=user_data.camunda_key
                     )
-                    self._user_mappings[telegram_user_id] = mapping
-                    
-                    # Cache in UserProfile for next time
-                    from luka_bot.models.user_profile import UserProfile
-                    from datetime import datetime
-                    
-                    profile = UserProfile(
-                        user_id=telegram_user_id,  # UserProfile only has user_id, not telegram_user_id
-                        username=user_data.username or f"user_{telegram_user_id}",
-                        first_name=getattr(user_data, 'first_name', None),
-                        last_name=getattr(user_data, 'last_name', None),
-                        language=getattr(user_data, 'language_code', 'en') or 'en',
-                        camunda_user_id=user_data.camunda_user_id,
-                        camunda_key=user_data.camunda_key,
-                        created_at=datetime.utcnow(),
-                        updated_at=datetime.utcnow()
-                    )
-                    await profile_service.save_profile(profile)
+                    self._user_mappings[user_id] = mapping
                     
                     logger.info(
                         f"🔐 Created Camunda mapping from Flow API: "
-                        f"Telegram {telegram_user_id} → Camunda {user_data.camunda_user_id}"
+                        f"User {user_id} → Camunda {user_data.camunda_user_id}"
                     )
-                    logger.info(f"💾 Cached credentials in UserProfile for future use")
+                    logger.info(f"💾 Cached credentials in memory for future use")
                     return mapping
+                
+                # User not found - create them if this is a web user
+                # Only create if user_data is None (user truly doesn't exist)
+                if platform == "web" and not user_data:
+                    logger.info(f"🆕 Creating new Flow API user for web user {user_id}...")
+                    
+                    # Generate stable webapp_user_id if not provided
+                    if not webapp_user_id:
+                        # Use user_id as webapp_user_id if it's a valid UUID
+                        # Otherwise generate from user_id
+                        try:
+                            from uuid import UUID as UUIDType
+                            UUIDType(user_id)  # Validate it's a UUID
+                            webapp_user_id = user_id
+                        except (ValueError, TypeError):
+                            # Generate deterministic UUID4 from user_id
+                            seed = f"web_user_{user_id}".encode()
+                            hash_bytes = hashlib.md5(seed).digest()
+                            
+                            # Create UUID from bytes and set version/variant bits for UUID4
+                            uuid_bytes = bytearray(hash_bytes[:16])
+                            uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40  # Set version 4
+                            uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80  # Set variant 10
+                            webapp_user_id = str(UUID(bytes=bytes(uuid_bytes)))
+                    
+                    try:
+                        # Create user in Flow API (will auto-create Camunda credentials)
+                        logger.info(f"🆕 Creating Flow API user with webapp_user_id={webapp_user_id}")
+                        created_user = await flow_client.add_user(
+                            username=f"web_user_{user_id[:8]}",
+                            webapp_user_id=webapp_user_id,  # Pass string directly
+                            telegram_user_id=None,  # Web users don't have telegram_user_id
+                            language_code="en"
+                        )
+                        
+                        if created_user and created_user.camunda_user_id and created_user.camunda_key:
+                            mapping = CamundaUserMapping(
+                                user_id=user_id,
+                                camunda_user_id=created_user.camunda_user_id,
+                                camunda_password=created_user.camunda_key
+                            )
+                            self._user_mappings[user_id] = mapping
+
+                            logger.info(
+                                f"✅ Created new Flow API user with Camunda credentials: "
+                                f"User {user_id} → Camunda {created_user.camunda_user_id}"
+                            )
+                            return mapping
+                    except Exception as create_error:
+                        error_str = str(create_error)
+                        # If user already exists (409 Conflict), fetch them and use their credentials
+                        # Flow API should have created Camunda credentials when the user was first created
+                        if "409" in error_str or "Conflict" in error_str:
+                            logger.info(f"🔄 User already exists in Flow API (409), fetching existing user by webapp_user_id={webapp_user_id}")
+                            try:
+                                # Try to get user by webapp_user_id, handling potential 422 errors
+                                existing_user = None
+                                if webapp_user_id:
+                                    try:
+                                        from uuid import UUID as UUIDType
+                                        uuid_obj = UUIDType(webapp_user_id)
+                                        existing_user = await flow_client.get_user(webapp_id=str(uuid_obj))
+                                    except (ValueError, Exception) as uuid_error:
+                                        logger.debug(f"⚠️ Could not query by webapp_user_id after 409: {uuid_error}, trying user_id")
+                                
+                                # If webapp_user_id lookup failed, try user_id (Flow API UUID) as fallback
+                                if not existing_user:
+                                    try:
+                                        existing_user = await flow_client.get_user(user_id=user_id)
+                                    except Exception:
+                                        pass
+                                
+                                # Flow API should have created Camunda credentials when user was created
+                                if existing_user and existing_user.camunda_user_id and existing_user.camunda_key:
+                                    mapping = CamundaUserMapping(
+                                        user_id=user_id,
+                                        camunda_user_id=existing_user.camunda_user_id,
+                                        camunda_password=existing_user.camunda_key
+                                    )
+                                    self._user_mappings[user_id] = mapping
+                                    
+                                    logger.info(
+                                        f"🔐 Created Camunda mapping from existing Flow API user: "
+                                        f"User {user_id} → Camunda {existing_user.camunda_user_id}"
+                                    )
+                                    return mapping
+                                elif existing_user:
+                                    # User exists but missing Camunda credentials - this is a Flow API bug
+                                    logger.error(
+                                        f"❌ Existing user {existing_user.id} found but missing Camunda credentials. "
+                                        f"camunda_user_id={existing_user.camunda_user_id}. "
+                                        "Flow API should have created Camunda credentials when user was created."
+                                    )
+                                    raise ValueError(
+                                        f"User {existing_user.id} exists in Flow API but has no Camunda credentials. "
+                                        "Flow API's create_user endpoint should automatically create Camunda credentials. "
+                                        "Please check Flow API logs and ensure create_camunda_user is working correctly."
+                                    )
+                            except ValueError:
+                                # Re-raise ValueError (missing credentials)
+                                raise
+                            except Exception as fetch_error:
+                                logger.error(f"❌ Failed to fetch existing user after 409: {fetch_error}")
+                        logger.error(f"❌ Failed to create Flow API user: {create_error}", exc_info=True)
+                        # Fall through to error below
+                        
         except Exception as e:
-            logger.warning(f"⚠️  Could not fetch from Flow API: {e}")
+            logger.warning(f"⚠️  Could not fetch/create from Flow API: {e}", exc_info=True)
         
         # No credentials found anywhere
-        logger.error(f"❌ No Camunda credentials for user {telegram_user_id}")
+        logger.error(f"❌ No Camunda credentials for user {user_id}")
         raise ValueError(
-            f"User {telegram_user_id} has no Camunda credentials. "
+            f"User {user_id} has no Camunda credentials. "
             "Credentials should be provided via Flow API authentication. "
             "Please ensure:\n"
             "1. User is registered in Flow API\n"
@@ -197,13 +425,29 @@ class CamundaService:
     
     async def start_process(
         self,
-        telegram_user_id: int,
+        user_id: str,
         process_key: str,
         business_key: Optional[str] = None,
-        variables: Optional[Dict[str, Any]] = None
+        variables: Optional[Dict[str, Any]] = None,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
     ) -> ProcessInstanceSchema:
-        """Start a BPMN process for user"""
-        client = await self._get_client(telegram_user_id)
+        """
+        Start a BPMN process for user.
+        
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            process_key: Process definition key
+            business_key: Optional business key
+            variables: Process variables
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform type ("web" or "telegram")
+        """
+        client = await self._get_client(
+            user_id,
+            webapp_user_id=webapp_user_id,
+            platform=platform
+        )
         
         # Convert variables to Camunda format
         logger.debug(f"📤 Raw variables for process {process_key}: {variables}")
@@ -217,7 +461,7 @@ class CamundaService:
                 variables=camunda_vars
             )
             logger.info(
-                f"🚀 Started process {process_key} for user {telegram_user_id}: {process_instance.id} "
+                f"🚀 Started process {process_key} for user {user_id}: {process_instance.id} "
                 f"with {len(variables or {})} variables (business_key={business_key})"
             )
             return process_instance
@@ -227,7 +471,7 @@ class CamundaService:
     
     async def correlate_message(
         self,
-        telegram_user_id: int,
+        user_id: str,
         message_data: Dict[str, Any],
         message_type: str,
         kb_doc_id: str
@@ -236,7 +480,7 @@ class CamundaService:
         Send message to Camunda via correlation with ES document ID.
         
         Args:
-            telegram_user_id: Telegram user ID
+            user_id: Flow API UUID (string) - primary identifier
             message_data: Message data with thread context
             message_type: Message type (GROUP_MESSAGE, DM_MESSAGE, ASSISTANT_MESSAGE)
             kb_doc_id: Document ID for ES reference
@@ -245,7 +489,7 @@ class CamundaService:
             True if successful
         """
         try:
-            client = await self._get_client(telegram_user_id)
+            client = await self._get_client(user_id)
             camunda_variables = self._format_message_variables(message_data, message_type, kb_doc_id)
             
             from camunda_client.clients.engine.schemas import SendCorrelationMessageSchema
@@ -265,8 +509,10 @@ class CamundaService:
     
     async def get_user_tasks(
         self,
-        telegram_user_id: int,
-        process_definition_key: Optional[str] = None
+        user_id: str,
+        process_definition_key: Optional[str] = None,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
     ) -> List[TaskSchema]:
         """
         Get tasks assigned to user, optionally filtered by process definition.
@@ -275,23 +521,41 @@ class CamundaService:
         sub-processes where the root is the user's chatbot_start instance.
 
         Args:
-            telegram_user_id: Telegram user ID
+            user_id: Flow API UUID (string) - primary identifier
             process_definition_key: Optional process key (e.g., "chatbot_start")
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform identifier ("web" or "telegram")
 
         Returns:
             List of tasks matching the criteria
         """
-        client = await self._get_client(telegram_user_id)
-        mapping = self._user_mappings[telegram_user_id]
+        client = await self._get_client(user_id, webapp_user_id=webapp_user_id, platform=platform)
+        
+        # Safely get mapping - _get_client should have created it, but check to avoid KeyError
+        mapping = self._user_mappings.get(user_id)
+        if not mapping:
+            logger.error(
+                f"❌ No user mapping found for user {user_id} after _get_client. "
+                f"This should not happen - _get_client should create the mapping. "
+                f"Available mappings: {list(self._user_mappings.keys())}"
+            )
+            # Try to get mapping again by calling _get_or_create_user_mapping directly
+            mapping = await self._get_or_create_user_mapping(
+                user_id,
+                webapp_user_id=webapp_user_id,
+                platform=platform
+            )
+            if not mapping:
+                raise ValueError(f"Failed to create user mapping for {user_id}")
 
         # Special handling for chatbot_start: include sub-process tasks
         if process_definition_key == "chatbot_start":
             process_instances = await self._get_chatbot_start_process_instances(
-                telegram_user_id, client
+                user_id, client
             )
             
             if not process_instances:
-                logger.debug(f"📋 No chatbot_start process found for user {telegram_user_id}")
+                logger.debug(f"📋 No chatbot_start process found for user {user_id}")
                 return []
             
             # Collect tasks from all process instances (root + sub-processes)
@@ -305,7 +569,7 @@ class CamundaService:
                 all_tasks.extend(tasks)
             
             logger.debug(
-                f"📋 Retrieved {len(all_tasks)} tasks for user {telegram_user_id} "
+                f"📋 Retrieved {len(all_tasks)} tasks for user {user_id} "
                 f"from chatbot_start and {len(process_instances) - 1} sub-processes"
             )
             return list(all_tasks)
@@ -319,27 +583,33 @@ class CamundaService:
 
         if process_definition_key:
             logger.debug(
-                f"📋 Retrieved {len(tasks)} tasks for user {telegram_user_id} "
+                f"📋 Retrieved {len(tasks)} tasks for user {user_id} "
                 f"from process {process_definition_key}"
             )
         else:
-            logger.debug(f"📋 Retrieved {len(tasks)} tasks for user {telegram_user_id}")
+            logger.debug(f"📋 Retrieved {len(tasks)} tasks for user {user_id}")
 
         return list(tasks)
     
     async def _get_chatbot_start_process_instances(
         self, 
-        telegram_user_id: int, 
+        user_id: str, 
         client
     ) -> List[ProcessInstanceSchema]:
         """
         Get chatbot_start root process and its direct sub-processes.
         
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            client: Camunda client
+        
         Returns list containing: [root_instance, sub_instance_1, sub_instance_2, ...]
         """
         from camunda_client.clients.engine.schemas.query import ProcessInstanceQuerySchema
         
-        business_key = f"{telegram_user_id}-chatbot-start"
+        # Business key format for chatbot_start: {user_id}-chatbot-start
+        # Note: user_id is now Flow API UUID (string)
+        business_key = f"{user_id}-chatbot-start"
         
         # Get root chatbot_start process
         root_query = ProcessInstanceQuerySchema(
@@ -372,7 +642,7 @@ class CamundaService:
     
     async def get_process_instance_by_business_key(
         self,
-        telegram_user_id: int,
+        user_id: str,
         business_key: str,
         active_only: bool = True
     ) -> Optional[ProcessInstanceSchema]:
@@ -380,7 +650,7 @@ class CamundaService:
         Get process instance by business key.
         
         Args:
-            telegram_user_id: Telegram user ID (for authentication)
+            user_id: Flow API UUID (string) - primary identifier (for authentication)
             business_key: Business key to search for (e.g., "import_-1001902150742_922705")
             active_only: Only return active (non-suspended) instances
         
@@ -389,7 +659,7 @@ class CamundaService:
         """
         from camunda_client.clients.engine.schemas.query import ProcessInstanceQuerySchema
         
-        client = await self._get_client(telegram_user_id)
+        client = await self._get_client(user_id)
         
         query = ProcessInstanceQuerySchema(
             business_key=business_key,
@@ -414,24 +684,143 @@ class CamundaService:
             logger.error(f"Error querying process instances: {e}")
             return None
     
-    async def get_task(self, telegram_user_id: int, task_id: str) -> Optional[TaskSchema]:
-        """Get specific task by ID"""
-        client = await self._get_client(telegram_user_id)
-        return await client.get_task(task_id)
+    async def delete_process_instance(
+        self,
+        user_id: str,
+        process_instance_id: str,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
+    ) -> bool:
+        """
+        Delete a process instance.
+        
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            process_instance_id: Process instance ID to delete
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform identifier ("web" or "telegram")
+        
+        Returns:
+            True if deletion successful, False otherwise
+        """
+        client = await self._get_client(user_id, webapp_user_id=webapp_user_id, platform=platform)
+        try:
+            await client.delete_process(process_instance_id)
+            logger.info(f"✅ Deleted process instance {process_instance_id} for user {user_id}")
+            return True
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"⚠️ Process instance {process_instance_id} not found")
+                return False
+            elif e.response.status_code == 403:
+                logger.warning(f"⚠️ Permission denied to delete process instance {process_instance_id}")
+                return False
+            else:
+                logger.error(f"❌ Error deleting process instance {process_instance_id}: {e.response.status_code}")
+                raise
+        except Exception as e:
+            logger.error(f"❌ Unexpected error deleting process instance {process_instance_id}: {e}", exc_info=True)
+            raise
+    
+    async def get_task(
+        self, 
+        user_id: str, 
+        task_id: str,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
+    ) -> Optional[TaskSchema]:
+        """
+        Get specific task by ID and verify it belongs to the user.
+        
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            task_id: Task ID to fetch
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform identifier ("web" or "telegram")
+        
+        This method ensures the task is accessible to the user by:
+        1. First trying to fetch the task directly
+        2. If found, verifying it's assigned to the user or accessible via candidate groups
+        
+        Note: If a task was shown in the user's menu, it should be accessible here.
+        This handles race conditions where tasks might be newly created.
+        """
+        client = await self._get_client(user_id, webapp_user_id=webapp_user_id, platform=platform)
+        mapping = self._user_mappings.get(user_id)
+        
+        if not mapping:
+            logger.warning(f"No Camunda mapping for user {user_id}")
+            return None
+        
+        try:
+            # Try to get task directly
+            task = await client.get_task(task_id)
+            
+            if not task:
+                # Task not found - might have been completed/deleted
+                logger.warning(
+                    f"Task {task_id} not found for user {user_id}. "
+                    f"This might mean the task was completed, deleted, or never existed."
+                )
+                return None
+            
+            # Verify task belongs to user by checking assignee
+            # If task is assigned, it must be assigned to this user
+            if task.assignee:
+                if task.assignee != mapping.camunda_user_id:
+                    logger.warning(
+                        f"Task {task_id} is assigned to {task.assignee}, "
+                        f"but user {user_id} (camunda_user_id: {mapping.camunda_user_id}) tried to access it. "
+                        f"Checking if task is accessible via candidate groups..."
+                    )
+                    # Fallback: Check if task is in user's task list (might be accessible via candidate groups)
+                    # This handles cases where task is in candidate groups
+                    user_tasks = await self.get_user_tasks(user_id)
+                    task_ids = [str(t.id) for t in user_tasks]
+                    if task_id not in task_ids:
+                        logger.error(
+                            f"Task {task_id} not accessible to user {user_id}. "
+                            f"Assignee: {task.assignee}, User's camunda_user_id: {mapping.camunda_user_id}. "
+                            f"This is a security issue - task should not be accessible to this user."
+                        )
+                        return None
+                    # Task is accessible to user (via candidate groups or other means)
+                    logger.debug(f"Task {task_id} accessible to user {user_id} (not directly assigned)")
+            else:
+                # Task has no assignee - this is fine, it might be a candidate task
+                # or newly created. Since it was found via direct lookup, allow it.
+                logger.debug(
+                    f"Task {task_id} has no assignee - allowing access for user {user_id}. "
+                    f"This might be a candidate task or newly created task."
+                )
+
+            return task
+
+        except Exception as e:
+            logger.error(f"Error fetching task {task_id} for user {user_id}: {e}")
+            return None
     
     async def get_task_variables(
         self,
-        telegram_user_id: int,
-        task_id: str
+        user_id: str,
+        task_id: str,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
     ) -> List[Dict[str, Any]]:
         """
         Get form variables for task.
+        
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            task_id: Task ID
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform identifier ("web" or "telegram")
         
         Returns:
             List of variable dicts with keys: name, value, type, writable, valueInfo
             Returns empty list if task has no form (404 error).
         """
-        client = await self._get_client(telegram_user_id)
+        client = await self._get_client(user_id, webapp_user_id=webapp_user_id, platform=platform)
         
         try:
             # get_task_form_variables returns dict[str, VariableValueSchema]
@@ -474,18 +863,26 @@ class CamundaService:
     
     async def get_process_definition(
         self,
-        telegram_user_id: int,
-        process_key: str
+        user_id: str,
+        process_key: str,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
     ) -> Optional[Dict[str, Any]]:
         """
         Get process definition details (name, description, etc.).
-        
+
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            process_key: Process definition key
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform identifier ("web" or "telegram")
+
         Returns:
             Dict with process definition details or None if not found
         """
         from camunda_client.clients.engine.schemas.query import ProcessDefinitionQuerySchema
-        
-        client = await self._get_client(telegram_user_id)
+
+        client = await self._get_client(user_id, webapp_user_id=webapp_user_id, platform=platform)
         try:
             # Query for process definition by key (latest version)
             query = ProcessDefinitionQuerySchema(
@@ -531,30 +928,134 @@ class CamundaService:
             return {
                 "key": process_key,
                 "name": display_name,
-                "description": None
+                "description": None,
+                "version": None
             }
+    
+    async def get_process_definitions_batch(
+        self,
+        process_keys: List[str],
+        user_id: str,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
+    ) -> List[Dict[str, Any]]:
+        """
+        Get process definition details for multiple process keys in batch.
+
+        Args:
+            process_keys: List of process definition keys
+            user_id: Flow API UUID (string) - primary identifier
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform identifier ("web" or "telegram")
+
+        Returns:
+            List of process definition dicts with: key, name, description, version
+            Missing processes are skipped (not included in result)
+        """
+        results = []
+
+        for process_key in process_keys:
+            try:
+                definition = await self.get_process_definition(
+                    user_id=user_id,
+                    process_key=process_key,
+                    webapp_user_id=webapp_user_id,
+                    platform=platform
+                )
+                if definition:
+                    results.append(definition)
+            except Exception as e:
+                logger.warning(f"Could not fetch process definition for {process_key}: {e}")
+                # Skip this process, continue with others
+                continue
+        
+        logger.info(f"📋 Fetched {len(results)}/{len(process_keys)} process definitions")
+        return results
+    
+    async def get_start_form_key(
+        self,
+        user_id: str,
+        process_key: str,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get start form key information for a process definition.
+
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            process_key: Process definition key
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform identifier ("web" or "telegram")
+
+        Returns:
+            Dict with keys: formKey, camundaFormRef, contextPath
+            - formKey: string or None
+              - None: no form (process can be started directly)
+              - "embedded:app:path/to/form.html": embedded HTML form
+              - other string: form key for deployed form
+            - camundaFormRef: dict with binding, key, version (if deployed form)
+            - contextPath: string (deployment context path)
+
+            Returns None if error occurs
+        """
+        client = await self._get_client(user_id, webapp_user_id=webapp_user_id, platform=platform)
+        try:
+            form_key_info = await client.get_process_definition_start_form_key(process_key)
+            logger.info(f"📋 Start form key for {process_key}: {form_key_info} (type: {type(form_key_info)})")
+            return form_key_info
+        except Exception as e:
+            error_str = str(e)
+            # Check if it's a 404 (no form) vs other error
+            if "404" in error_str or "Not Found" in error_str:
+                logger.debug(f"📝 Process {process_key} has no start form")
+                return {"formKey": None, "camundaFormRef": None, "contextPath": None}
+            else:
+                logger.warning(f"⚠️ Error getting start form key for {process_key}: {e}")
+                return None
     
     async def get_start_form_variables(
         self,
-        telegram_user_id: int,
-        process_key: str
+        user_id: str,
+        process_key: str,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
     ) -> tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Get start form variables for process definition.
-        
+
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            process_key: Process definition key
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform identifier ("web" or "telegram")
+
         Returns:
             Tuple of (variables_list, error_message)
             - If successful: (variables, None)
             - If no start form: ([], None)
             - If error: ([], error_message)
-        
+
         Each variable dict contains: name, value, type, label, valueInfo
         """
-        client = await self._get_client(telegram_user_id)
+        client = await self._get_client(
+            user_id,
+            webapp_user_id=webapp_user_id,
+            platform=platform
+        )
         try:
             # get_process_definition_start_form returns a dict[str, VariableValueSchema]
             # where VariableValueSchema has attributes: value, type, label, value_info
+            # This works for both generated forms (from variables) and embedded forms (Camunda forms)
             variables_dict = await client.get_process_definition_start_form(process_key)
+            
+            # If the dict is empty, it might mean:
+            # 1. No form exists
+            # 2. Form exists but has no variables (embedded form with no inputs)
+            if not variables_dict:
+                logger.debug(f"📝 Process {process_key} has start form but no variables (might be embedded form)")
+                # Return empty list with no error - the form exists but has no fields
+                return ([], None)
             
             # Convert dict to list format, preserving labels
             # var_data is ALWAYS a VariableValueSchema object (not a dict)
@@ -612,12 +1113,26 @@ class CamundaService:
     
     async def complete_task(
         self,
-        telegram_user_id: int,
+        user_id: str,
         task_id: str,
-        variables: Optional[Dict[str, Any]] = None
-    ) -> None:
-        """Complete a task with variables"""
-        client = await self._get_client(telegram_user_id)
+        variables: Optional[Dict[str, Any]] = None,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
+    ) -> bool:
+        """
+        Complete a task with variables.
+
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            task_id: Task ID to complete
+            variables: Optional dict of variables to submit
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform identifier ("web" or "telegram")
+
+        Returns:
+            True if task was completed successfully, False otherwise
+        """
+        client = await self._get_client(user_id, webapp_user_id=webapp_user_id, platform=platform)
         
         logger.debug(f"📤 Raw variables for task {task_id}: {variables}")
         camunda_vars = self._format_variables(variables or {})
@@ -629,7 +1144,142 @@ class CamundaService:
         logger.debug(f"📤 Complete task payload: {payload}")
         
         await client.complete_task(task_id, variables=payload)
-        logger.info(f"✅ Completed task {task_id} for user {telegram_user_id} with {len(variables or {})} variables")
+        logger.info(f"✅ Completed task {task_id} for user {user_id} with {len(variables or {})} variables")
+        return True
+    
+    async def get_completed_task_details(
+        self,
+        user_id: str,
+        task_id: str,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get completed task details from Camunda History API.
+
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            task_id: Task ID to get details for
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform identifier ("web" or "telegram")
+
+        Returns:
+            Dict with task details including name, description, completion time, and variables, or None if not found
+        """
+        from uuid import UUID
+        from camunda_client.clients.engine.schemas.body import GetHistoryTasksFilterSchema
+
+        client = await self._get_client(user_id, webapp_user_id=webapp_user_id, platform=platform)
+        
+        try:
+            # Query history API for completed task
+            filter_schema = GetHistoryTasksFilterSchema(
+                finished=True
+            )
+            # Note: GetHistoryTasksFilterSchema doesn't have task_id filter directly,
+            # so we'll filter after fetching
+            history_tasks = await client.get_history_tasks(filter_schema)
+            
+            # Find the specific task by ID
+            task = None
+            for t in history_tasks:
+                if str(t.id) == task_id:
+                    task = t
+                    break
+            
+            if not task:
+                logger.warning(f"⚠️ Completed task {task_id} not found in history")
+                return None
+            
+            # Get variables from process instance
+            variables = {}
+            try:
+                variable_instances = await client.get_variable_instances(
+                    process_instance_id=task.process_instance_id,
+                    deserialize_values=True
+                )
+                for var in variable_instances:
+                    variables[var.name] = var.value
+            except Exception as e:
+                logger.warning(f"⚠️ Could not fetch variables for completed task {task_id}: {e}")
+            
+            return {
+                "id": str(task.id),
+                "name": task.name,
+                "description": task.description,
+                "completedAt": task.end_time.isoformat() if task.end_time else None,
+                "processInstanceId": str(task.process_instance_id),
+                "processDefinitionKey": task.process_definition_key,
+                "variables": variables
+            }
+        except Exception as e:
+            logger.error(f"❌ Error getting completed task details for {task_id}: {e}", exc_info=True)
+            return None
+    
+    async def get_completed_tasks_for_process(
+        self,
+        user_id: str,
+        process_instance_id: str,
+        webapp_user_id: Optional[str] = None,
+        platform: str = "telegram",
+        limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all completed tasks for a process instance from Camunda History API.
+
+        Args:
+            user_id: Flow API UUID (string) - primary identifier
+            process_instance_id: Process instance ID
+            webapp_user_id: Optional webapp_user_id for web users
+            platform: Platform identifier ("web" or "telegram")
+            limit: Maximum number of completed tasks to return (default: 10)
+
+        Returns:
+            List of completed task details
+        """
+        from uuid import UUID
+        from camunda_client.clients.engine.schemas.body import GetHistoryTasksFilterSchema
+
+        client = await self._get_client(user_id, webapp_user_id=webapp_user_id, platform=platform)
+        
+        try:
+            # Query history API for completed tasks in this process instance
+            filter_schema = GetHistoryTasksFilterSchema(
+                process_instance_id=UUID(process_instance_id),
+                finished=True
+            )
+            history_tasks = await client.get_history_tasks(filter_schema)
+            
+            # Get variables for the process instance (once for all tasks)
+            variables_map = {}
+            try:
+                variable_instances = await client.get_variable_instances(
+                    process_instance_id=process_instance_id,
+                    deserialize_values=True
+                )
+                for var in variable_instances:
+                    variables_map[var.name] = var.value
+            except Exception as e:
+                logger.warning(f"⚠️ Could not fetch variables for process {process_instance_id}: {e}")
+            
+            # Convert to list of dicts, sorted by completion time (most recent first)
+            completed_tasks = []
+            for task in sorted(history_tasks, key=lambda t: t.end_time if t.end_time else datetime.min, reverse=True)[:limit]:
+                completed_tasks.append({
+                    "id": str(task.id),
+                    "name": task.name,
+                    "description": task.description,
+                    "completedAt": task.end_time.isoformat() if task.end_time else None,
+                    "processInstanceId": str(task.process_instance_id),
+                    "processDefinitionKey": task.process_definition_key,
+                    "variables": variables_map.copy()  # Share variables across tasks in same process
+                })
+            
+            logger.debug(f"📋 Found {len(completed_tasks)} completed tasks for process {process_instance_id}")
+            return completed_tasks
+        except Exception as e:
+            logger.error(f"❌ Error getting completed tasks for process {process_instance_id}: {e}", exc_info=True)
+            return []
     
     def _format_variables(self, variables: Dict[str, Any]) -> Dict:
         """Format variables for Camunda"""
